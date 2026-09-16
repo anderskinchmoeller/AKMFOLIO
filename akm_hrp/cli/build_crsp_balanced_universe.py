@@ -27,21 +27,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--returns",
-        default="wrds_full_clean/weekly_returns.csv",
+        default="data/weekly_returns.csv",
     )
     parser.add_argument(
         "--base-pit",
-        default="wrds_full_clean/pit_universe_delisting_safe.csv",
+        default="data/pit_universe_delisting_safe.csv",
         help="Broad safety/eligibility mask intersected after balanced selection.",
     )
     parser.add_argument(
         "--structural-features",
-        default="wrds_full_clean/structural_alpha_features.csv.gz",
+        default="data/structural_alpha_features.csv.gz",
         help="Lagged CRSP market-cap/liquidity feature table.",
     )
     parser.add_argument(
         "--sector-history",
-        default="wrds_full_clean/crsp_sector_history.csv.gz",
+        default="data/crsp_sector_history.csv.gz",
         help="Date-effective CRSP UES/ICB/SIC history.",
     )
     parser.add_argument(
@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--asset-metadata",
-        default="wrds_full_clean/crsp_security_metadata.csv",
+        default="data/crsp_security_metadata.csv",
     )
     parser.add_argument(
         "--macro-returns",

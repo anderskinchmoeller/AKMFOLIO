@@ -379,3 +379,109 @@ def test_sparse_live_holding_is_repaired_for_costed_exit() -> None:
     assert added in allocator.last_selected_assets
     assert target.loc[added] == pytest.approx(0.0, abs=1e-9)
     assert allocator.last_diagnostics.unrepresentable_exit_weight == 0.0
+
+
+def test_dust_holding_below_min_weight_is_not_force_carried() -> None:
+    """A leftover position below the configured min_weight should be written
+    off (dropped from `held`/forced exits) instead of being ramped forever,
+    per the exit_materiality_threshold fix: prepare_allocation_window reuses
+    min_weight (falling back to a small fixed floor when min_weight == 0)
+    instead of only excluding floating-point noise."""
+    returns, balanced_pit, _, allocator = _model_fixture()
+    full = returns.iloc[:-1]
+    allocator.allocate(full)
+    core = balanced_pit.columns[:15]
+    added = allocator.last_selected_assets.difference(core)[0]
+
+    allocator.config = replace(allocator.config, min_weight=0.02)
+
+    live = pd.Series(0.0, index=returns.columns)
+    live.loc[core[:10]] = 0.095
+    live.loc[added] = 0.01  # below min_weight=0.02, above floating-point _EPS
+    allocator.set_current_weights(live)
+
+    prepared = allocator.prepare_allocation_window(
+        full, full.drop(columns=[added]), live
+    )
+
+    assert added not in allocator._forced_exit_assets
+    assert added not in prepared.columns
+
+
+@pytest.mark.parametrize(
+    "dust_weight",
+    [
+        0.000157,  # first reported instance (2026-09-09 full-scale run)
+        0.000243,  # second reported instance, different rebalance date
+    ],
+)
+def test_dust_holding_below_materiality_floor_does_not_abort_allocate(
+    dust_weight: float,
+) -> None:
+    """Regression test for a real crash found running the model at full
+    broad-universe scale: a leftover position sized between _EPS and the
+    5e-4 materiality floor (e.g. weight=1.57e-4, from turnover-cap drift)
+    is correctly judged immaterial by prepare_allocation_window and left
+    off the window (see test_dust_holding_below_min_weight_is_not_force_
+    carried above) -- but the subsequent allocate() call still summed that
+    same dust weight as an "omitted" live holding and compared it against
+    its own, much tighter maximum_unrepresentable_weight (default 1e-8),
+    raising "RuntimeError: Live holdings could not be represented in the
+    MPC window; omitted weight=<value>." and aborting the entire
+    walk-forward run over a position the model had already decided to
+    write off. Fixed by having allocate() reuse the same materiality floor
+    (self._held_materiality_threshold, set by prepare_allocation_window) to
+    decide what counts as a real omission instead of a write-off.
+
+    Parametrized over every distinct dust weight actually reported in the
+    wild so far -- the fix is a threshold comparison, not a special case for
+    one literal number, and a second live run surfacing a second value
+    (0.000243, at a different rebalance date) is exactly the scenario this
+    parametrization exists to keep covered."""
+    returns, balanced_pit, _, allocator = _model_fixture()
+    full = returns.iloc[:-1]
+    allocator.allocate(full)
+    core = balanced_pit.columns[:15]
+    added = allocator.last_selected_assets.difference(core)[0]
+
+    live = pd.Series(0.0, index=returns.columns)
+    live.loc[core[:10]] = 0.095
+    live.loc[added] = dust_weight  # dust: above _EPS, below the 5e-4 floor
+    allocator.set_current_weights(live)
+
+    prepared = allocator.prepare_allocation_window(
+        full, full.drop(columns=[added]), live
+    )
+    assert added not in prepared.columns  # written off, as before the fix
+
+    target = allocator.allocate(prepared)  # must not raise
+
+    assert added not in target.index
+    assert allocator.last_diagnostics.unrepresentable_exit_weight == pytest.approx(
+        0.0, abs=1e-9
+    )
+
+
+def test_material_holding_at_or_above_min_weight_is_still_force_carried() -> None:
+    """The companion case: a position that is still above the materiality
+    floor must keep being restored as a forced exit, same as before the
+    fix -- the threshold should only write off genuine dust."""
+    returns, balanced_pit, _, allocator = _model_fixture()
+    full = returns.iloc[:-1]
+    allocator.allocate(full)
+    core = balanced_pit.columns[:15]
+    added = allocator.last_selected_assets.difference(core)[0]
+
+    allocator.config = replace(allocator.config, min_weight=0.02)
+
+    live = pd.Series(0.0, index=returns.columns)
+    live.loc[core[:10]] = 0.095
+    live.loc[added] = 0.03  # above min_weight=0.02
+    allocator.set_current_weights(live)
+
+    prepared = allocator.prepare_allocation_window(
+        full, full.drop(columns=[added]), live
+    )
+
+    assert added in allocator._forced_exit_assets
+    assert added in prepared.columns

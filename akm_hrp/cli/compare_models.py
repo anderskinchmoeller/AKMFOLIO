@@ -62,7 +62,8 @@ from akm_hrp.backtest.engine import (
 )
 from akm_hrp.config import HRPConfig
 from akm_hrp.data.returns import load_and_clean_returns
-from akm_hrp.diagnostics.dashboard import export_backtest_dashboard
+from akm_hrp.diagnostics.dashboard import export_backtest_dashboard, _export_dashboard_period
+from akm_hrp.diagnostics.robustness import write_robustness_report
 from akm_hrp.diagnostics.significance import newey_west_mean_test
 from akm_hrp.overlay.bounds import apply_bounds
 
@@ -93,11 +94,26 @@ class InverseVolatilityAllocator:
         return apply_bounds(raw, 0.0, self.config.max_weight)
 
 
+def _parse_turnover_cap(value: str):
+    if str(value).strip().lower() == "none":
+        return None
+    if value == "default":
+        return "default"
+    cap = float(value)
+    if not (cap >= 0.0 and cap < float("inf")):
+        raise argparse.ArgumentTypeError(
+            "--max-rebalance-turnover must be a non-negative number or 'none'."
+        )
+    return cap
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare robust HRP with institutional benchmark allocators."
     )
     parser.add_argument("--returns", default="weekly_returns.csv")
+    parser.add_argument("--dashboard-every-year", action="store_true",
+                        help="Save and announce annual dashboards during the focus model run.")
     parser.add_argument(
         "--factor-returns",
         default=None,
@@ -173,6 +189,21 @@ def parse_args() -> argparse.Namespace:
         help="Maximum SLSQP iterations for retail_alpha_mpc (default: 450).",
     )
     parser.add_argument(
+        "--retail-mpc-allow-cvar-floor-relaxation",
+        action="store_true",
+        help=(
+            "Let retail_alpha_mpc's optimizer log a small, controlled CVaR "
+            "overshoot instead of raising when constraint repair can't reach "
+            "exact feasibility. Off by default, matching "
+            "RetailAlphaMPCConfig's own risk-policy default of raising "
+            "rather than silently breaching the CVaR limit -- pass this if "
+            "an unattended walk-forward run should keep going through that "
+            "corner instead. Mirrors "
+            "--retail-alpha-ml-allow-cvar-floor-relaxation, which only "
+            "wires into retail_alpha_ml_mpc, not this (plain) model."
+        ),
+    )
+    parser.add_argument(
         "--retail-alpha-ml-max-total-assets",
         type=int,
         default=40,
@@ -180,6 +211,28 @@ def parse_args() -> argparse.Namespace:
             "Hard cap on retail_alpha_ml_mpc's total book size (core + "
             "additions); the derived per-name weight floor is "
             "1/this value (default: 40)."
+        ),
+    )
+    parser.add_argument(
+        "--retail-alpha-ml-min-weight",
+        type=float,
+        default=None,
+        help=(
+            "Per-name weight floor for names retail_alpha_ml_mpc holds "
+            "(e.g. 0.01 = 1%%). Default: 1/--retail-alpha-ml-max-total-assets."
+        ),
+    )
+    parser.add_argument(
+        "--retail-alpha-ml-max-weight",
+        type=float,
+        default=None,
+        help=(
+            "Override RetailAlphaMPCConfig.max_weight (default 0.03), the "
+            "per-name position cap the ML sleeve inherits. Pass 1.0 to remove "
+            "the cap entirely -- concentration is then limited only by the "
+            "sector and +/-0.25 style-exposure caps and by the max-total-assets "
+            "trim, and the optimizer's feasible region grows a lot, so solves "
+            "get slower and repair passes more likely."
         ),
     )
     parser.add_argument(
@@ -193,6 +246,67 @@ def parse_args() -> argparse.Namespace:
             "per-rebalance compute cost for long weekly-cadence runs at the "
             "expense of a shorter effective ML training lookback."
         ),
+    )
+    parser.add_argument(
+        "--retail-alpha-ml-min-training-cross-sections",
+        type=int,
+        default=None,
+        help=(
+            "Override ml_minimum_training_cross_sections (default 12): how "
+            "many buffered cross-sections must exist before the ML ensemble "
+            "trains at all. A sample-size gate, counted in cross-sections, "
+            "so it does NOT need rescaling when the cadence changes."
+        ),
+    )
+    parser.add_argument(
+        "--retail-alpha-ml-fast-halflife",
+        type=float,
+        default=None,
+        help=(
+            "Override ml_fast_halflife_rebalances (default 6). Counted in "
+            "REBALANCES, not weeks, so its calendar meaning moves with "
+            "--rebalance-every-weeks: 6 is ~6 weeks at weekly cadence and "
+            "~18 months at 13w. See --retail-alpha-ml-slow-halflife."
+        ),
+    )
+    parser.add_argument(
+        "--retail-alpha-ml-slow-halflife",
+        type=float,
+        default=None,
+        help=(
+            "Override ml_slow_halflife_rebalances (default 24). Also counted "
+            "in rebalances. The fast/slow pair is the ensemble's only source "
+            "of diversity between its two gradient-boosted votes -- they are "
+            "otherwise the same estimator on the same buffer -- so the gap "
+            "between them is what makes the third vote's job meaningful. "
+            "Must be strictly greater than the fast halflife."
+        ),
+    )
+    parser.add_argument(
+        "--retail-alpha-ml-retrain-every",
+        type=int,
+        default=None,
+        help=(
+            "Override ml_retrain_every_n_rebalances (default 5). In "
+            "rebalances: ~5 weeks at weekly cadence, ~15 months at 13w."
+        ),
+    )
+    parser.add_argument(
+        "--retail-alpha-ml-ic-halflife",
+        type=float,
+        default=None,
+        help=(
+            "Override ic_halflife_rebalances (default 12), the decay on the "
+            "rolling rank-IC estimates that weight each signal. In "
+            "rebalances: ~12 weeks at weekly cadence, ~3 years at 13w."
+        ),
+    )
+    parser.add_argument(
+        "--retail-alpha-ml-allow-exposure-limit-relaxation",
+        action="store_true",
+        help=("Allow the minimum common additive increase in sector/style caps "
+              "when the ML MPC affine constraints are infeasible; logs the "
+              "increase and records exposure_limit_relaxation in diagnostics."),
     )
     parser.add_argument(
         "--retail-alpha-ml-allow-cvar-floor-relaxation",
@@ -368,6 +482,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tc-bps", type=float, default=10.0)
     parser.add_argument(
+        "--max-rebalance-turnover",
+        type=_parse_turnover_cap,
+        default="default",
+        help=(
+            "Per-rebalance L1 turnover cap applied by the backtest engine to "
+            "every model (2.0 = the whole book can be replaced; 'none' = no "
+            "cap). Default: HRPConfig's 0.10, which is sized for weekly "
+            "rebalancing and freezes the book at slow cadences."
+        ),
+    )
+    parser.add_argument(
         "--rebalance-every-weeks",
         type=int,
         default=4,
@@ -418,6 +543,37 @@ def parse_args() -> argparse.Namespace:
         "--diagnostics-output",
         default=None,
         help="Optional CSV containing latest scalar allocator diagnostics.",
+    )
+    parser.add_argument(
+        "--robustness-output",
+        default=None,
+        help=(
+            "Optional directory for an offline robustness report: paired "
+            "moving-block and regime-stratified bootstrap confidence "
+            "intervals, causal volatility-regime and CUSUM structural-break "
+            "HAC significance, fixed-trade cost stress at 1x/1.5x/2x, and "
+            "optimizer-repair/CVaR-relaxation frequency, per model against "
+            "--significance-benchmark. Never affects backtest results -- "
+            "purely a post-hoc report over what already ran."
+        ),
+    )
+    parser.add_argument(
+        "--robustness-samples",
+        type=int,
+        default=1000,
+        help="Bootstrap draws per model for the robustness report (default: 1000).",
+    )
+    parser.add_argument(
+        "--robustness-block-weeks",
+        type=int,
+        default=8,
+        help="Moving block length in weeks for the robustness bootstrap (default: 8).",
+    )
+    parser.add_argument(
+        "--robustness-seed",
+        type=int,
+        default=0,
+        help="Random seed for the robustness bootstrap (default: 0).",
     )
     parser.add_argument(
         "--dashboard-pdf",
@@ -478,6 +634,44 @@ def _load_ticker_map(path: Path) -> dict[str, str]:
 
     clean = clean.drop_duplicates("permno", keep="last")
     return dict(zip(clean["permno"], clean["ticker"], strict=True))
+
+
+def _resolve_asset_metadata_path(args: argparse.Namespace) -> Path | None:
+    """Locate CRSP permno/ticker metadata for readable asset labels.
+
+    An explicit --asset-metadata always wins. Otherwise we look beside the
+    returns file and beside the PIT file (their usual home), then fall back
+    to the repo-wide canonical data/crsp_security_metadata.csv. That last
+    fallback matters for trimmed/scratch inputs -- e.g. the smoke test's
+    outputs/smoke_test/weekly_returns_trimmed_*.csv -- which don't carry
+    their own metadata file and previously left every weights/dashboard
+    export showing raw PERMNOs with no way to recover the ticker.
+    """
+    if args.asset_metadata:
+        explicit = Path(args.asset_metadata)
+        if explicit.exists():
+            return explicit
+        print(f"warning: --asset-metadata path not found: {explicit}", flush=True)
+        return None
+
+    candidates = [Path(args.returns).resolve().parent / "crsp_security_metadata.csv"]
+    pit_path = getattr(args, "pit", None)
+    if pit_path:
+        candidates.append(Path(pit_path).resolve().parent / "crsp_security_metadata.csv")
+    candidates.append(
+        Path(__file__).resolve().parents[2] / "data" / "crsp_security_metadata.csv"
+    )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    print(
+        "warning: no asset metadata found in any of "
+        f"{[str(c) for c in candidates]}; asset values remain source identifiers",
+        flush=True,
+    )
+    return None
 
 
 def _merge_balanced_only_returns(
@@ -559,6 +753,111 @@ def _save_weights_png(frame: pd.DataFrame, path: Path, top_n: int) -> None:
     plt.close(figure)
 
 
+def _ml_config_overrides(args) -> dict:
+    """Explicitly-set ML memory overrides, validated against each other.
+
+    Five of these settings are counted in REBALANCES, not weeks, so changing
+    --rebalance-every-weeks silently rescales what the model remembers: the
+    "fast" halflife of 6 means ~6 weeks at weekly cadence and ~18 months at
+    13-week cadence, and the fast/slow pair (6 vs 24) collapses from 6-vs-24
+    weeks to 18-months-vs-6-years. That is why they are exposed here rather
+    than left to the dataclass defaults.
+
+    There is no automatic cadence rescaling, deliberately. Preserving the
+    weekly *calendar* horizons at 13w would put both tree halflives below a
+    single rebalance, which is degenerate; preserving them in rebalances is
+    what already happens. Neither is right, so the choice is the operator's,
+    and the validation below only rules out the combinations that are
+    incoherent whatever the cadence.
+
+    The two cross-section settings are different in kind: they are sample-size
+    gates on the training buffer, not memory horizons, so they are counted in
+    cross-sections and do not track the cadence at all.
+    """
+
+    defaults = RetailAlphaMLMPCConfig()
+    overrides: dict = {}
+
+    def take(attribute, config_field):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            overrides[config_field] = value
+        return overrides.get(config_field, getattr(defaults, config_field))
+
+    maximum = take(
+        "retail_alpha_ml_max_training_cross_sections",
+        "ml_max_training_cross_sections",
+    )
+    minimum = take(
+        "retail_alpha_ml_min_training_cross_sections",
+        "ml_minimum_training_cross_sections",
+    )
+    fast = take("retail_alpha_ml_fast_halflife", "ml_fast_halflife_rebalances")
+    slow = take("retail_alpha_ml_slow_halflife", "ml_slow_halflife_rebalances")
+    retrain = take("retail_alpha_ml_retrain_every", "ml_retrain_every_n_rebalances")
+    ic_halflife = take("retail_alpha_ml_ic_halflife", "ic_halflife_rebalances")
+
+    if fast <= 0 or slow <= 0 or ic_halflife <= 0:
+        raise ValueError(
+            "ML halflives must be positive; got fast="
+            f"{fast}, slow={slow}, ic={ic_halflife}."
+        )
+    if fast >= slow:
+        # Equal halflives make the two GBMs the same estimator fit twice on the
+        # same rows with the same weights: an ensemble of one, at twice the
+        # cost, with a consensus fraction that is meaninglessly 1.0.
+        raise ValueError(
+            f"ML fast halflife ({fast}) must be strictly less than the slow "
+            f"halflife ({slow}); equal or inverted values make the two "
+            "gradient-boosted votes identical."
+        )
+    if retrain < 1:
+        raise ValueError(f"ML retrain interval must be >= 1 rebalance; got {retrain}.")
+    if minimum < 1:
+        raise ValueError(
+            f"ML minimum training cross-sections must be >= 1; got {minimum}."
+        )
+    if minimum > maximum:
+        raise ValueError(
+            f"ML minimum training cross-sections ({minimum}) exceeds the "
+            f"maximum ({maximum}); the ensemble could never train."
+        )
+
+    # Per-name position cap. Validated against the floor and the book size so a
+    # combination that can never be fully invested is rejected at parse time
+    # rather than as an opaque solver failure some hours into a walk-forward.
+    max_weight = take("retail_alpha_ml_max_weight", "max_weight")
+    if not 0.0 < max_weight <= 1.0:
+        raise ValueError(f"ML max weight must be in (0, 1]; got {max_weight}.")
+    budget = getattr(args, "retail_alpha_ml_max_total_assets", None) or (
+        defaults.ml_max_total_assets
+    )
+    if budget * max_weight < 1.0 - 1e-9:
+        raise ValueError(
+            f"ML max weight {max_weight} caps a {budget}-name book at "
+            f"{budget * max_weight:.4f} of capital; it can never be fully "
+            "invested. Raise --retail-alpha-ml-max-weight or the asset budget."
+        )
+    floor = getattr(args, "retail_alpha_ml_min_weight", None)
+    if floor is not None and floor > max_weight:
+        raise ValueError(
+            f"ML min weight ({floor}) exceeds max weight ({max_weight})."
+        )
+    if floor is not None and budget * floor > 1.0 + 1e-9:
+        # The floor is a post-solve prune-and-reproject, not a solver bound, so
+        # this does not crash -- it silently caps the book at 1/floor names and
+        # the asset budget above that is inert. Refuse rather than run a
+        # walk-forward whose headline setting does nothing.
+        raise ValueError(
+            f"ML min weight {floor} x asset budget {budget} = "
+            f"{budget * floor:.3f} > 1.0, so the floor is unreachable at full "
+            f"occupancy: the book is capped at {int(1.0 / floor)} names and the "
+            f"budget of {budget} is inert. Lower --retail-alpha-ml-min-weight "
+            f"to <= {1.0 / budget:.4f}, or lower the asset budget."
+        )
+    return overrides
+
+
 def main() -> None:
     args = parse_args()
     if args.rebalance_every_weeks < 1:
@@ -567,6 +866,14 @@ def main() -> None:
         raise ValueError("--retail-optimizer-max-iterations must be at least 1.")
     if args.retail_alpha_ml_max_total_assets < 2:
         raise ValueError("--retail-alpha-ml-max-total-assets must be at least 2.")
+    if args.retail_alpha_ml_min_weight is not None and not (
+        0.0 < args.retail_alpha_ml_min_weight
+        <= 1.0 / args.retail_alpha_ml_max_total_assets
+    ):
+        raise ValueError(
+            "--retail-alpha-ml-min-weight must be in (0, "
+            "1/--retail-alpha-ml-max-total-assets]."
+        )
     if args.retail_edge_mpc_horizon < 1:
         raise ValueError("--retail-edge-mpc-horizon must be at least 1.")
     if args.retail_edge_max_added_assets < 0:
@@ -613,6 +920,11 @@ def main() -> None:
         strict_pit_universe=bool(pit_path),
         tc_bps=args.tc_bps,
         min_holding_weeks=args.rebalance_every_weeks,
+        **(
+            {}
+            if args.max_rebalance_turnover == "default"
+            else {"max_rebalance_turnover_l1": args.max_rebalance_turnover}
+        ),
         **(
             {"lookback_weeks": args.lookback_weeks}
             if args.lookback_weeks is not None
@@ -666,6 +978,9 @@ def main() -> None:
             for path in args.hrp_alpha_structural_features
         ]
         structural_features = combine_structural_feature_tables(structural_tables)
+
+    # Validated once, shared by every RetailAlphaMLMPCConfig built below.
+    ml_config_kwargs = _ml_config_overrides(args)
 
     models = {
         "equal_weight": EqualWeightAllocator(config.max_weight),
@@ -785,6 +1100,9 @@ def main() -> None:
                     planning_horizon=args.retail_mpc_horizon,
                     planning_step_weeks=args.rebalance_every_weeks,
                     optimizer_max_iterations=args.retail_optimizer_max_iterations,
+                    allow_cvar_floor_relaxation=(
+                        args.retail_mpc_allow_cvar_floor_relaxation
+                    ),
                 ),
             )
         if "retail_alpha_ml_mpc" in requested_dynamic_names:
@@ -799,18 +1117,13 @@ def main() -> None:
                     planning_step_weeks=args.rebalance_every_weeks,
                     optimizer_max_iterations=args.retail_optimizer_max_iterations,
                     ml_max_total_assets=args.retail_alpha_ml_max_total_assets,
-                    **(
-                        {
-                            "ml_max_training_cross_sections": (
-                                args.retail_alpha_ml_max_training_cross_sections
-                            )
-                        }
-                        if args.retail_alpha_ml_max_training_cross_sections
-                        is not None
-                        else {}
-                    ),
+                    ml_min_weight=args.retail_alpha_ml_min_weight,
+                    **ml_config_kwargs,
                     allow_cvar_floor_relaxation=(
                         args.retail_alpha_ml_allow_cvar_floor_relaxation
+                    ),
+                    allow_exposure_limit_relaxation=(
+                        args.retail_alpha_ml_allow_exposure_limit_relaxation
                     ),
                     ml_kelly_mix_enabled=args.retail_alpha_ml_kelly_mix_enabled,
                     ml_kelly_scale_enabled=args.retail_alpha_ml_kelly_scale_enabled,
@@ -840,18 +1153,13 @@ def main() -> None:
                     planning_step_weeks=args.rebalance_every_weeks,
                     optimizer_max_iterations=args.retail_optimizer_max_iterations,
                     ml_max_total_assets=args.retail_alpha_ml_max_total_assets,
-                    **(
-                        {
-                            "ml_max_training_cross_sections": (
-                                args.retail_alpha_ml_max_training_cross_sections
-                            )
-                        }
-                        if args.retail_alpha_ml_max_training_cross_sections
-                        is not None
-                        else {}
-                    ),
+                    ml_min_weight=args.retail_alpha_ml_min_weight,
+                    **ml_config_kwargs,
                     allow_cvar_floor_relaxation=(
                         args.retail_alpha_ml_allow_cvar_floor_relaxation
+                    ),
+                    allow_exposure_limit_relaxation=(
+                        args.retail_alpha_ml_allow_exposure_limit_relaxation
                     ),
                     ml_kelly_mix_enabled=args.retail_alpha_ml_kelly_mix_enabled,
                     ml_kelly_scale_enabled=args.retail_alpha_ml_kelly_scale_enabled,
@@ -878,18 +1186,13 @@ def main() -> None:
                     planning_step_weeks=args.rebalance_every_weeks,
                     optimizer_max_iterations=args.retail_optimizer_max_iterations,
                     ml_max_total_assets=args.retail_alpha_ml_max_total_assets,
-                    **(
-                        {
-                            "ml_max_training_cross_sections": (
-                                args.retail_alpha_ml_max_training_cross_sections
-                            )
-                        }
-                        if args.retail_alpha_ml_max_training_cross_sections
-                        is not None
-                        else {}
-                    ),
+                    ml_min_weight=args.retail_alpha_ml_min_weight,
+                    **ml_config_kwargs,
                     allow_cvar_floor_relaxation=(
                         args.retail_alpha_ml_allow_cvar_floor_relaxation
+                    ),
+                    allow_exposure_limit_relaxation=(
+                        args.retail_alpha_ml_allow_exposure_limit_relaxation
                     ),
                     ml_kelly_mix_enabled=args.retail_alpha_ml_kelly_mix_enabled,
                     ml_kelly_scale_enabled=args.retail_alpha_ml_kelly_scale_enabled,
@@ -940,14 +1243,94 @@ def main() -> None:
     diagnostic_rows = []
     backtest_results = {}
     significance_trials = max(args.deflated_sharpe_trials, len(models))
+    live_focus = args.dashboard_focus_model or next(iter(models))
+    metadata_path = _resolve_asset_metadata_path(args)
+    live_tickers = _load_ticker_map(metadata_path) if metadata_path is not None else None
+
+    def save_live_year(year, annual_result):
+        start = pd.Timestamp(args.evaluation_start) if args.evaluation_start else None
+        valid = annual_result.portfolio_returns.dropna()
+        if start is not None:
+            valid = valid.loc[valid.index >= start]
+        if valid.empty:
+            return
+        from dataclasses import replace
+        annual_results = {}
+        for other_name, other in backtest_results.items():
+            mask = other.portfolio_returns.index.year == year
+            annual_results[other_name] = replace(
+                other, portfolio_returns=other.portfolio_returns.loc[mask],
+                weights=other.weights.loc[mask], turnover=other.turnover.loc[mask],
+                transaction_costs=(other.transaction_costs.loc[mask]
+                                   if other.transaction_costs is not None else None))
+        annual_results[live_focus] = annual_result
+        def year_path(path):
+            path = Path(path) if path else None
+            return path.with_name(f"{path.stem}_{year}{path.suffix}") if path else None
+        paths = _export_dashboard_period(
+            annual_results, focus_model=live_focus,
+            output_pdf=year_path(args.dashboard_pdf), output_png=year_path(args.dashboard_png),
+            title=f"{args.dashboard_title or live_focus} - {year}",
+            tc_bps=args.tc_bps, lookback_weeks=config.lookback_weeks,
+            rolling_sharpe_years=args.dashboard_rolling_sharpe_years,
+            heatmap_assets=args.dashboard_heatmap_assets,
+            evaluation_start=args.evaluation_start, ticker_map=live_tickers)
+        for kind, path in paths.items():
+            print(f"Year {year}: saved dashboard {kind}: {path.resolve()}", flush=True)
+
+    failed_models: list[str] = []
+    checkpoint_directory = Path(args.output).parent / "partial"
+
+    def checkpoint(name, result, rows_so_far):
+        """Persist one finished model's series and the metric rows so far.
+
+        A walk-forward that dies late is expensive: `comparison.csv` and
+        friends are only written after every model finishes, so a failure in
+        the last model of a 17-hour run discarded the *other* models'
+        completed results too. These checkpoints are written as each model
+        finishes, so a later crash costs only the model that crashed.
+        """
+        try:
+            checkpoint_directory.mkdir(parents=True, exist_ok=True)
+            series = {
+                "portfolio_return": result.portfolio_returns,
+                "turnover": result.turnover,
+            }
+            if result.transaction_costs is not None:
+                series["transaction_cost"] = result.transaction_costs
+            pd.DataFrame(series).to_csv(
+                checkpoint_directory / f"{name}_series.csv", index_label="date"
+            )
+            pd.DataFrame(rows_so_far).set_index("model").to_csv(
+                checkpoint_directory / "comparison_partial.csv"
+            )
+            print(f"checkpoint: saved partial results for {name}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - never fail a run over a checkpoint
+            print(f"warning: checkpoint for {name} failed: {exc}", flush=True)
+
     for name, allocator in models.items():
-        result = run_walk_forward(
-            returns,
-            allocator,
-            config,
-            progress_every_rebalances=args.progress_every_rebalances,
-            progress_label=name,
-        )
+        try:
+            result = run_walk_forward(
+                returns,
+                allocator,
+                config,
+                progress_every_rebalances=args.progress_every_rebalances,
+                progress_label=name,
+                year_end_callback=(save_live_year if args.dashboard_every_year
+                                   and name == live_focus
+                                   and (args.dashboard_pdf or args.dashboard_png) else None),
+            )
+        except (RuntimeError, ValueError) as exc:
+            # One model's walk-forward blowing up should not destroy the models
+            # that already finished, nor the ones still queued behind it. Record
+            # it, keep going, and let the outputs below reflect what succeeded.
+            print(
+                f"warning: {name} walk-forward failed, skipping this model: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            failed_models.append(name)
+            continue
         backtest_results[name] = result
         score_mask = pd.Series(True, index=result.portfolio_returns.index)
         if args.evaluation_start is not None:
@@ -959,35 +1342,60 @@ def main() -> None:
             number_of_trials=significance_trials,
         )
         rows.append({"model": name, **metrics})
+        checkpoint(name, result, rows)
 
         if args.weights_output or args.weights_png or args.diagnostics_output:
-            target = latest_target_weights(
-                returns,
-                allocator,
-                config,
-                current_weights=result.ending_weights,
-            )
-            if args.weights_output or args.weights_png:
-                target = target[target > 1e-12]
-                weight_frames.append(
-                    pd.DataFrame(
+            # latest_target_weights is a one-shot, single-week transition
+            # from result.ending_weights to a fully-constraint-compliant
+            # target. That can be genuinely, correctly infeasible (e.g. the
+            # live book has drifted enough since the last rebalance that no
+            # portfolio satisfies weight/sector/style caps *and* a week's
+            # ADV participation budget at once) even when the walk-forward
+            # backtest above -- which only ever rebalances from an
+            # already-recent, already-compliant starting point -- ran
+            # cleanly the whole way through. Letting that raise here would
+            # discard every model's already-computed backtest row (rows is
+            # only written to comparison.csv after this whole loop ends)
+            # and skip every model still queued behind this one, over what
+            # is really just an optional bonus output. So: keep this
+            # model's backtest metrics (already appended above), skip only
+            # its weights/diagnostics row, and move on.
+            try:
+                target = latest_target_weights(
+                    returns,
+                    allocator,
+                    config,
+                    current_weights=result.ending_weights,
+                )
+            except (RuntimeError, ValueError) as exc:
+                print(
+                    f"warning: {name} latest_target_weights failed, "
+                    f"skipping its weights/diagnostics row: {exc}",
+                    flush=True,
+                )
+                target = None
+            if target is not None:
+                if args.weights_output or args.weights_png:
+                    target = target[target > 1e-12]
+                    weight_frames.append(
+                        pd.DataFrame(
+                            {
+                                "date": pd.Timestamp(returns.index[-1]).date().isoformat(),
+                                "model": name,
+                                "asset": target.index.astype(str),
+                                "weight": target.to_numpy(dtype=float),
+                            }
+                        )
+                    )
+                diagnostics = getattr(allocator, "last_diagnostics", None)
+                if args.diagnostics_output and hasattr(diagnostics, "as_dict"):
+                    diagnostic_rows.append(
                         {
                             "date": pd.Timestamp(returns.index[-1]).date().isoformat(),
                             "model": name,
-                            "asset": target.index.astype(str),
-                            "weight": target.to_numpy(dtype=float),
+                            **diagnostics.as_dict(),
                         }
                     )
-                )
-            diagnostics = getattr(allocator, "last_diagnostics", None)
-            if args.diagnostics_output and hasattr(diagnostics, "as_dict"):
-                diagnostic_rows.append(
-                    {
-                        "date": pd.Timestamp(returns.index[-1]).date().isoformat(),
-                        "model": name,
-                        **diagnostics.as_dict(),
-                    }
-                )
         print(f"completed: {name}", flush=True)
 
     benchmark_name = args.significance_benchmark
@@ -1009,6 +1417,15 @@ def main() -> None:
             row[f"{benchmark_name}_alpha_hac_t_stat"] = test["hac_t_stat"]
             row[f"{benchmark_name}_alpha_hac_p_value"] = test["hac_p_value"]
 
+    if failed_models:
+        print(
+            "warning: these models failed and are absent from the outputs: "
+            + ", ".join(failed_models)
+        )
+    if not rows:
+        # main() is called bare at module scope, so `return` here would exit 0
+        # and a caller scripting this would read the run as a success.
+        raise SystemExit("error: every model failed; no comparison to write.")
     comparison = pd.DataFrame(rows).set_index("model")
     destination = Path(args.output)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1016,33 +1433,28 @@ def main() -> None:
     print(comparison.to_string())
     print(f"saved: {destination.resolve()}")
 
-    if args.weights_output or args.weights_png:
+    if (args.weights_output or args.weights_png) and not weight_frames:
+        print(
+            "warning: no model produced latest target weights; "
+            "skipping weights outputs."
+        )
+    elif args.weights_output or args.weights_png:
         exported_weights = pd.concat(weight_frames, ignore_index=True)
 
-        metadata_path = (
-            Path(args.asset_metadata)
-            if args.asset_metadata
-            else Path(args.returns).resolve().parent / "crsp_security_metadata.csv"
-        )
-        if metadata_path.exists():
+        metadata_path = _resolve_asset_metadata_path(args)
+        if metadata_path is not None:
             exported_weights = _label_weight_frame(
                 exported_weights,
                 _load_ticker_map(metadata_path),
             )
-        else:
-            print(
-                f"warning: no asset metadata found at {metadata_path}; "
-                "asset values remain source identifiers",
-                flush=True,
-            )
 
-    if args.weights_output:
+    if args.weights_output and weight_frames:
         weights_destination = Path(args.weights_output)
         weights_destination.parent.mkdir(parents=True, exist_ok=True)
         exported_weights.to_csv(weights_destination, index=False)
         print(f"saved weights: {weights_destination.resolve()}")
 
-    if args.weights_png:
+    if args.weights_png and weight_frames:
         png_destination = Path(args.weights_png)
         _save_weights_png(exported_weights, png_destination, args.weights_png_top)
         print(f"saved weights chart: {png_destination.resolve()}")
@@ -1052,6 +1464,25 @@ def main() -> None:
         diagnostics_destination.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(diagnostic_rows).to_csv(diagnostics_destination, index=False)
         print(f"saved diagnostics: {diagnostics_destination.resolve()}")
+
+    if args.robustness_output and args.significance_benchmark not in backtest_results:
+        # Everything above is already on disk; a missing benchmark should not
+        # abort the run before the dashboard is written.
+        print(
+            "warning: skipping robustness report -- benchmark "
+            f"{args.significance_benchmark!r} is not in --models."
+        )
+    elif args.robustness_output:
+        write_robustness_report(
+            backtest_results,
+            Path(args.robustness_output),
+            benchmark=args.significance_benchmark,
+            evaluation_start=args.evaluation_start,
+            samples=args.robustness_samples,
+            block_weeks=args.robustness_block_weeks,
+            seed=args.robustness_seed,
+        )
+        print(f"saved robustness report: {Path(args.robustness_output).resolve()}")
 
     if args.dashboard_pdf or args.dashboard_png:
         if args.dashboard_focus_model is not None:
@@ -1069,18 +1500,8 @@ def main() -> None:
                 f"{sorted(backtest_results)}; received {focus_model!r}."
             )
 
-        metadata_path = (
-            Path(args.asset_metadata)
-            if args.asset_metadata
-            else Path(args.returns).resolve().parent / "crsp_security_metadata.csv"
-        )
-        ticker_map = _load_ticker_map(metadata_path) if metadata_path.exists() else None
-        if ticker_map is None:
-            print(
-                f"warning: no asset metadata found at {metadata_path}; "
-                "dashboard heatmap labels remain source identifiers",
-                flush=True,
-            )
+        metadata_path = _resolve_asset_metadata_path(args)
+        ticker_map = _load_ticker_map(metadata_path) if metadata_path is not None else None
 
         dashboard_paths = export_backtest_dashboard(
             backtest_results,

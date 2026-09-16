@@ -118,6 +118,8 @@ class RetailAlphaMPCDiagnostics:
     signal_ic_observations: dict[str, float]
     signal_coverages: dict[str, float]
 
+    exposure_limit_relaxation: float = 0.0
+
     def as_dict(self) -> dict[str, float | int | str | bool]:
         result: dict[str, float | int | str | bool] = {
             key: value
@@ -210,7 +212,7 @@ def _retail_signal_panel(
     zero_fraction = _field(snapshot, "zero_return_fraction_20d", assets, 0.0)
     liquidity = (
         _robust_zscore(np.log(adv))
-        - 0.5 * _robust_zscore(np.log1p(amihud.fillna(amihud.median())))
+        - 0.5 * _robust_zscore(np.log1p(amihud.fillna(amihud.median() if amihud.notna().any() else 0.0)))
         - 0.5 * _robust_zscore(zero_fraction)
     )
     recent_reversal = -((1.0 + returns.iloc[-4:]).prod() - 1.0)
@@ -389,7 +391,7 @@ def _predictive_factor_risk_model(
         {
             "size": _robust_zscore(np.log(market_caps.clip(lower=1.0))),
             "adv": _robust_zscore(np.log(adv)),
-            "amihud": _robust_zscore(np.log1p(amihud.fillna(amihud.median()))),
+            "amihud": _robust_zscore(np.log1p(amihud.fillna(amihud.median() if amihud.notna().any() else 0.0))),
             "zero": _robust_zscore(zero_fraction),
             "shock": _robust_zscore(
                 pd.Series(
@@ -482,7 +484,7 @@ def _spread_vector(
 ) -> np.ndarray:
     amihud = _field(snapshot, "amihud_20d", assets).clip(lower=0.0)
     zero = _field(snapshot, "zero_return_fraction_20d", assets, 0.0)
-    illiquidity = _robust_zscore(np.log1p(amihud.fillna(amihud.median()))).clip(
+    illiquidity = _robust_zscore(np.log1p(amihud.fillna(amihud.median() if amihud.notna().any() else 0.0))).clip(
         lower=0.0
     )
     zero_penalty = _robust_zscore(zero).clip(lower=0.0)
@@ -558,6 +560,14 @@ class RetailAlphaMPCAllocator(DynamicBarraAlphaAllocator):
         self._engine_current_weights: pd.Series | None = None
         self._engine_return_context: pd.DataFrame | None = None
         self._forced_exit_assets = pd.Index([])
+        # Matches the write-off floor computed in prepare_allocation_window
+        # (max(min_weight, 5e-4)); kept here too so allocate() has a sane
+        # value even on a first call that skipped prepare_allocation_window.
+        self._held_materiality_threshold = max(
+            float(getattr(self.config, "min_weight", 0.0)), 5e-4
+        )
+        self.last_exit_assets = pd.Index([])
+        self._training_dates: pd.Index | None = None
         self._previous_signal_panel: pd.DataFrame | None = None
         self._previous_signal_availability: pd.DataFrame | None = None
         self._previous_signal_date: pd.Timestamp | None = None
@@ -604,12 +614,30 @@ class RetailAlphaMPCAllocator(DynamicBarraAlphaAllocator):
         self._engine_current_weights = None
         self._engine_return_context = None
         self._forced_exit_assets = pd.Index([])
+        self._held_materiality_threshold = max(
+            float(getattr(self.config, "min_weight", 0.0)), 5e-4
+        )
+        self.last_exit_assets = pd.Index([])
+        self._training_dates: pd.Index | None = None
         self._previous_signal_panel = None
         self._previous_signal_availability = None
         self._previous_signal_date = None
         self._ic_sum = pd.Series(0.0, index=self.signal_names)
         self._ic_square_sum = pd.Series(0.0, index=self.signal_names)
         self._ic_weight = pd.Series(0.0, index=self.signal_names)
+
+    requires_split_training = True
+
+    def set_training_dates(self, dates: pd.Index) -> None:
+        """Restrict learned labels (IC, ML, Kelly) for online split validation."""
+        self._training_dates = pd.DatetimeIndex(dates).copy()
+
+    def _learning_interval_allowed(self, formation_date, label_dates) -> bool:
+        return self._training_dates is None or (
+            formation_date in self._training_dates
+            and len(label_dates) > 0
+            and pd.Index(label_dates).isin(self._training_dates).all()
+        )
 
     def set_current_weights(self, weights: pd.Series) -> None:
         """Receive the backtest engine's drifted pre-trade holdings."""
@@ -635,10 +663,33 @@ class RetailAlphaMPCAllocator(DynamicBarraAlphaAllocator):
                 if self._engine_current_weights is not None
                 else self._previous_weights
             )
+        # A position only stops counting as "held" once it decays below a
+        # meaningful floor, not just floating-point noise (_EPS). Reusing
+        # min_weight here means anything the optimizer would never size on
+        # purpose gets written off instead of being force-carried and ramped
+        # out indefinitely by the turnover cap. Falls back to a small fixed
+        # floor when min_weight is left at its 0.0 default so this still does
+        # something.
+        held_materiality_threshold = max(float(getattr(self.config, "min_weight", 0.0)), 5e-4)
+        # Recorded so allocate()'s omitted-weight crash-check (below) applies
+        # the SAME write-off floor used here to decide what counts as "held"
+        # and worth force-carrying. Without this, a dust position just under
+        # this floor (e.g. weight=1.57e-4, below the 5e-4 floor but well
+        # above allocate()'s maximum_unrepresentable_weight=1e-8) was
+        # correctly judged immaterial here -- so it was never force-carried
+        # into the window -- but then allocate() still summed it as an
+        # "omitted" live weight against its much tighter 1e-8 tolerance and
+        # aborted the whole walk-forward run over a position the model had
+        # already, deliberately, written off.
+        self._held_materiality_threshold = held_materiality_threshold
         held = (
             pd.Index([])
             if live is None
-            else pd.Index(pd.Series(live, dtype=float).loc[lambda x: x > _EPS].index)
+            else pd.Index(
+                pd.Series(live, dtype=float)
+                .loc[lambda x: x > held_materiality_threshold]
+                .index
+            )
         )
         original_eligible = pd.Index(eligible_window.columns)
         # Every live holding must remain representable even when it leaves PIT
@@ -711,7 +762,9 @@ class RetailAlphaMPCAllocator(DynamicBarraAlphaAllocator):
             (source.index > self._previous_signal_date)
             & (source.index <= current_date)
         ]
-        if forward_rows.empty:
+        if forward_rows.empty or not self._learning_interval_allowed(
+            self._previous_signal_date, forward_rows.index
+        ):
             return
         forward = (1.0 + forward_rows).prod(min_count=1) - 1.0
         decay = float(np.exp(np.log(0.5) / self.config.ic_halflife_rebalances))
@@ -941,6 +994,7 @@ class RetailAlphaMPCAllocator(DynamicBarraAlphaAllocator):
         continuing = core.append(pd.Index(additions)).drop_duplicates()
         held_assets = previously_held
         exiting = held_assets.difference(continuing)
+        self.last_exit_assets = exiting.copy()
         selected = continuing.append(exiting).drop_duplicates()
         selected_returns = window.loc[:, selected]
         selected_snapshot = snapshot.reindex(selected)
@@ -988,9 +1042,17 @@ class RetailAlphaMPCAllocator(DynamicBarraAlphaAllocator):
             else hrp.copy()
         )
         if has_previous:
+            # Only count weight lost above the same write-off floor that
+            # prepare_allocation_window used to decide what to force-carry
+            # (see the comment there). A live position at or below that
+            # floor was already, deliberately, judged immaterial and left
+            # off the window -- it is a write-off, not an omission -- so it
+            # must not also be judged against this method's much tighter
+            # maximum_unrepresentable_weight tolerance.
             omitted_weight = float(
                 live_previous.drop(index=selected, errors="ignore")
                 .clip(lower=0.0)
+                .loc[lambda values: values > self._held_materiality_threshold]
                 .sum()
             )
             if omitted_weight > self.config.maximum_unrepresentable_weight:

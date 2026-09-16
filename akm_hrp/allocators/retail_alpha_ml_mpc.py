@@ -137,7 +137,10 @@ adds a separate, opt-in short overlay (`short_overlay_enabled`, default
   `_short_overlay_weights` for the full construction.
 """
 
+import logging
+
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field as dataclass_field
 
 import numpy as np
@@ -265,12 +268,21 @@ class RetailAlphaMLMPCConfig(RetailAlphaMPCConfig):
     independently of universe size.
     """
 
+    # Opt-in: minimize a common additive relaxation of sector/style caps.
+    allow_exposure_limit_relaxation: bool = False
     ml_max_training_cross_sections: int = 252
     ml_fast_halflife_rebalances: float = 6.0
     ml_slow_halflife_rebalances: float = 24.0
+    # Smallest recency weight, relative to the newest cross-section's 1.0,
+    # that still earns a row a place in a tree model's training view. See
+    # `_recency_horizon` for why an unbounded ratio is a correctness problem
+    # and not just a wasted-work one.
+    ml_recency_weight_floor: float = 1e-6
     ml_minimum_training_cross_sections: int = 12
     ml_retrain_every_n_rebalances: int = 5
     ml_target_clip: float = 2.5
+    ml_shuffle_labels: bool = False
+    ml_placebo_seed: int = 0
     ml_prediction_clip: float = 4.0
     ml_gbm_n_estimators: int = 100
     ml_gbm_max_depth: int = 2
@@ -326,6 +338,11 @@ class RetailAlphaMLMPCConfig(RetailAlphaMPCConfig):
     # prune-and-reproject step rather than a solver constraint (SLSQP can't
     # express "either exactly 0 or >= floor" as a convex bound).
     ml_max_total_assets: int = 40
+    # Explicit per-name floor for held names. None keeps the coupled default
+    # 1 / ml_max_total_assets; a value set here should not exceed that, or the
+    # floor is unreachable at full occupancy (the cleanup then declines to
+    # prune rather than leave the book underinvested).
+    ml_min_weight: float | None = None
 
     # --- Enhanced predictive risk model -----------------------------------
     # Multi-scale factor covariance: three EWMA halflives blended together,
@@ -783,6 +800,27 @@ def _ml_design(signals: pd.DataFrame, market_caps: pd.Series) -> pd.DataFrame:
     return design.reindex(columns=_ML_FEATURES).clip(-6.0, 6.0)
 
 
+def _binding_capacity_rows(lower, upper, previous, capacity, steps):
+    """Keep only trade inequalities not strictly implied by position bounds.
+
+    For w[t] - w[t-1], the largest possible buy is upper[t] - lower[t-1]
+    and the largest sale is upper[t-1] - lower[t]. At t=0 the predecessor
+    is the fixed live portfolio. Retain boundary cases and nonfinite values.
+    Row order matches capacity_constraint and its analytic Jacobian.
+    """
+    rows = []
+    for step in steps:
+        prior_lower = previous if step == 0 else lower[step - 1]
+        prior_upper = previous if step == 0 else upper[step - 1]
+        maximum_buy = upper[step] - prior_lower
+        maximum_sell = prior_upper - lower[step]
+        rows.extend([
+            ~(np.isfinite(maximum_buy) & np.isfinite(capacity) & (maximum_buy < capacity)),
+            ~(np.isfinite(maximum_sell) & np.isfinite(capacity) & (maximum_sell < capacity)),
+        ])
+    return np.concatenate(rows) if rows else np.zeros(0, dtype=bool)
+
+
 def _multi_scale_factor_covariance(
     factor_returns: np.ndarray, config: "RetailAlphaMLMPCConfig"
 ) -> np.ndarray:
@@ -1126,11 +1164,14 @@ def _apply_min_weight_floor(
     bounds can express "weight in [lower, upper]" but not "weight is exactly
     0 or at least `min_weight`" (that disjunction is combinatorial: exact
     MIQP/MINLP territory this codebase's continuous solver doesn't attempt).
-    `protected` names (currently-held positions on a forced-exit schedule,
-    or the balanced-core universe) are never pruned here even if under the
-    floor -- that would silently override the exit schedule or the
-    admission logic's own decisions, which is not what a diversification
-    floor is for.
+    `protected` names -- currently-held positions on a forced-exit schedule,
+    and names already scheduled to exit -- are never pruned here even if
+    under the floor, since zeroing them would silently override the exit
+    schedule, which is not what a diversification floor is for. The
+    balanced-core universe is deliberately *not* protected: it is a
+    preferred universe that competes for slots in the max-total-assets trim,
+    not a mandatory holding, and protecting it here defeated the floor
+    entirely whenever the core exceeded `ml_max_total_assets`.
     """
 
     if weights.empty or min_weight <= 0.0:
@@ -1154,6 +1195,10 @@ def _apply_min_weight_floor(
     # too, so the projection is only free to reallocate the freed budget
     # across the kept/protected names it is meant to flow to.
     reproject_upper = upper_bound.reindex(weights.index).where(keep, 0.0)
+    if float(reproject_upper.sum()) < 1.0 - 1e-10:
+        # The floor is optional; keeping a feasible book takes precedence
+        # over removing dust when the remaining names cannot absorb it.
+        return weights
     return _project_box_simplex(pruned, lower, reproject_upper)
 
 
@@ -1715,6 +1760,10 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
         self.last_ml_feature_importances = pd.DataFrame()
         self.last_ml_linear_coefficients = pd.Series(dtype=float)
         self.last_ml_consensus_fraction = 0.0
+        self._placebo_rng = np.random.default_rng(self.config.ml_placebo_seed)
+        # Signals already reported as unusable, so each is named once per run
+        # rather than at every rebalance. See `_report_unusable_signals`.
+        self._reported_unusable_signals: set[str] = set()
         self.last_short_overlay_weights = pd.Series(dtype=float)
         self.last_short_overlay_cost = 0.0
         self._tax_rate_per_name: pd.Series | None = None
@@ -1759,6 +1808,54 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             unrealized_gain_frac, dtype=float
         ).copy()
 
+    def _report_unusable_signals(
+        self, coverage: pd.Series, as_of: pd.Timestamp
+    ) -> None:
+        """Name, once per run, any signal that cannot contribute at all.
+
+        A signal whose inputs are missing gets coverage 0.0, which
+        `signal_availability` turns into weight 0.0 -- exactly what a signal
+        the IC machinery has *decided against* also gets. The two are
+        indistinguishable in the outputs, so four of this model's nine signals
+        sat dead for its entire history and were only found by asking why the
+        book tracked its benchmark so closely (see
+        `four_signals_zero_coverage_missing_compustat_features.md`).
+
+        Zero coverage is a missing *input*, not a verdict, and it is worth
+        saying out loud. Coverage that is merely below
+        `minimum_signal_coverage` is reported separately: that one is a
+        judgement the configuration made deliberately.
+        """
+
+        if coverage is None or coverage.empty:
+            return
+        floor = float(self.config.minimum_signal_coverage)
+        for signal, value in coverage.items():
+            if signal in self._reported_unusable_signals:
+                continue
+            value = float(value)
+            if value <= _EPS:
+                self._reported_unusable_signals.add(signal)
+                logging.getLogger(__name__).warning(
+                    "%s at %s: signal %r has ZERO coverage -- its input "
+                    "columns are absent, so it can never earn weight. This is "
+                    "missing data, not a rejected signal.",
+                    type(self).__name__,
+                    as_of,
+                    signal,
+                )
+            elif value < floor:
+                self._reported_unusable_signals.add(signal)
+                logging.getLogger(__name__).warning(
+                    "%s at %s: signal %r covers %.1f%% of the cross-section, "
+                    "below minimum_signal_coverage=%.1f%%, so it is excluded.",
+                    type(self).__name__,
+                    as_of,
+                    signal,
+                    100.0 * value,
+                    100.0 * floor,
+                )
+
     def _update_dynamic_ics(
         self, returns: pd.DataFrame, current_date: pd.Timestamp
     ) -> None:
@@ -1801,7 +1898,9 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             (source.index > self._previous_signal_date)
             & (source.index <= current_date)
         ]
-        if forward_rows.empty:
+        if forward_rows.empty or not self._learning_interval_allowed(
+            self._previous_signal_date, forward_rows.index
+        ):
             return
         forward = (1.0 + forward_rows).prod(min_count=1) - 1.0
         forward = forward.dropna()
@@ -1947,7 +2046,9 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             (source.index > self._previous_ml_date)
             & (source.index <= current_date)
         ]
-        if forward_rows.empty:
+        if forward_rows.empty or not self._learning_interval_allowed(
+            self._previous_ml_date, forward_rows.index
+        ):
             return
         forward = (1.0 + forward_rows).prod(min_count=1) - 1.0
         common = self._previous_ml_design.index.intersection(forward.dropna().index)
@@ -1962,6 +2063,8 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             -self.config.ml_target_clip, self.config.ml_target_clip
         )
         y = target.fillna(0.0).to_numpy(dtype=float)
+        if self.config.ml_shuffle_labels:
+            y = self._placebo_rng.permutation(y)
         # One buffer entry per formation date, regardless of how many names
         # were eligible that day -- this is what keeps the buffer's capacity
         # measured in cross-sections rather than in raw row count.
@@ -1983,15 +2086,53 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             self._refit_models()
             self._ml_rebalances_since_retrain = 0
 
-    def _recency_weights(self, decay: float) -> np.ndarray:
+    def _recency_weights(self, decay: float, entries=None) -> np.ndarray:
         """Per-row sample weights: 1.0 for the newest buffered cross-section,
-        decaying by `decay` per rebalance for each cross-section further back."""
+        decaying by `decay` per rebalance for each cross-section further back.
 
+        `entries` defaults to the whole rolling buffer; `_training_view`
+        passes the truncated tail it actually fits on."""
+
+        if entries is None:
+            entries = self._ml_history
         weights = []
-        for age, (_, y) in enumerate(reversed(self._ml_history)):
+        for age, (_, y) in enumerate(reversed(entries)):
             weights.append(np.full(len(y), decay**age, dtype=float))
         weights.reverse()
         return np.concatenate(weights, axis=0)
+
+    def _recency_horizon(self, decay: float) -> int:
+        """How many of the newest buffered cross-sections carry a recency
+        weight at or above `ml_recency_weight_floor`.
+
+        Weights decay geometrically with age, so once the buffer is long
+        relative to a model's halflife the oldest rows carry weights orders
+        of magnitude below the newest: at the default 252-cross-section
+        buffer and a fast halflife of 6 rebalances the ratio reaches
+        1 : 2.5e-13. Those rows contribute nothing to the fit but everything
+        to the dynamic range of `sample_weight`, and sklearn's weighted
+        impurity accumulation loses enough precision across that range that
+        every tree reports zero total importance -- so `feature_importances_`
+        divides 0 by 0 and comes back all-NaN, with a RuntimeWarning as the
+        only symptom. Predictions survive it, the published diagnostic does
+        not. Truncating at the floor bounds the ratio by `1 / floor` and, as
+        a side effect, roughly halves the fast model's refit cost.
+        """
+
+        floor = float(self.config.ml_recency_weight_floor)
+        if not 0.0 < floor < 1.0 or not 0.0 < decay < 1.0:
+            return len(self._ml_history)
+        max_age = int(np.floor(np.log(floor) / np.log(decay)))
+        return max(1, min(len(self._ml_history), max_age + 1))
+
+    def _training_view(self, decay: float):
+        """`(x, y, sample_weight)` over the newest `_recency_horizon`
+        cross-sections, weighted 1.0 at the newest and decaying with age."""
+
+        entries = list(self._ml_history)[-self._recency_horizon(decay) :]
+        x = np.concatenate([entry[0] for entry in entries], axis=0)
+        y = np.concatenate([entry[1] for entry in entries], axis=0)
+        return x, y, self._recency_weights(decay, entries)
 
     def _refit_models(self) -> None:
         """Refit fast/slow/linear models from scratch on the current rolling
@@ -2006,8 +2147,8 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
         slow_decay = float(
             np.exp(np.log(0.5) / self.config.ml_slow_halflife_rebalances)
         )
-        fast_weights = self._recency_weights(fast_decay)
-        slow_weights = self._recency_weights(slow_decay)
+        fast_x, fast_y, fast_weights = self._training_view(fast_decay)
+        slow_x, slow_y, slow_weights = self._training_view(slow_decay)
 
         gbm_kwargs = dict(
             n_estimators=self.config.ml_gbm_n_estimators,
@@ -2017,9 +2158,19 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             random_state=self.config.ml_gbm_random_state,
         )
         fast_model = GradientBoostingRegressor(**gbm_kwargs)
-        fast_model.fit(x, y, sample_weight=fast_weights)
         slow_model = GradientBoostingRegressor(**gbm_kwargs)
-        slow_model.fit(x, y, sample_weight=slow_weights)
+        # Independent estimators share read-only training inputs. Tree building
+        # releases the GIL; two workers avoid copying the rolling buffer into
+        # child processes. Wait for both fits before publishing model state.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ml-gbm") as pool:
+            fast_fit = pool.submit(
+                fast_model.fit, fast_x, fast_y, sample_weight=fast_weights
+            )
+            slow_fit = pool.submit(
+                slow_model.fit, slow_x, slow_y, sample_weight=slow_weights
+            )
+            fast_fit.result()
+            slow_fit.result()
 
         # Third vote: an unweighted ridge over the whole buffer. Deliberately
         # not recency-weighted -- the trees already cover "recent matters
@@ -2292,11 +2443,17 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             window.std(skipna=True) > _EPS
         )
         observed_window = window.loc[:, valid].copy()
-        window = observed_window.fillna(observed_window.mean())
+        # Series-valued fillna fragments pandas storage into one block per
+        # asset. Consolidate once before repeated cross-sectional reductions.
+        window = observed_window.fillna(observed_window.mean()).copy()
         if window.shape[1] < 2:
             raise ValueError("Retail Alpha MPC has too few eligible assets.")
         if window.shape[1] * self.config.max_weight < 1.0 - 1e-9:
-            raise ValueError("max_weight is infeasible for the eligible asset count.")
+            raise ValueError(
+                f"max_weight={self.config.max_weight:.4f} across "
+                f"{window.shape[1]} eligible assets caps total investable weight "
+                f"at {window.shape[1] * self.config.max_weight:.4f} (< 1.0)."
+            )
 
         as_of = pd.Timestamp(window.index[-1])
         snapshot = self.features.snapshot(as_of, window.columns)
@@ -2309,6 +2466,7 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             window, snapshot, exposures, market_caps, observed_window
         )
         self._update_dynamic_ics(window, as_of)
+        self._report_unusable_signals(signal_coverage, as_of)
         signal_availability = (
             broad_signals.std(ddof=0).gt(1e-8)
             & signal_coverage.ge(self.config.minimum_signal_coverage)
@@ -2381,25 +2539,107 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             if len(additions) >= self.config.maximum_added_assets:
                 break
 
-        # --- Modification (4): max-total-assets trim. `core` and
-        # `previously_held` are never trimmed here (their fate is decided by
-        # the admission/exit-schedule logic above and below); only the
-        # lowest-conviction tail of `additions` is dropped, and only if the
-        # forced names alone don't already exceed the cap -- an over-budget
-        # book from `core`+`previously_held` alone is tolerated rather than
-        # raised, since neither the balanced-core universe nor an existing
-        # live holding should be silently dropped by a diversification cap.
-        forced_names = core.union(previously_held)
-        available_for_additions = max(
-            int(self.config.ml_max_total_assets) - len(forced_names), 0
+        # --- Modification (4): max-total-assets trim.
+        #
+        # The balanced core is a *preferred* universe, not a hard floor: core
+        # names and newly admitted names compete on the same admission score,
+        # and the book is the top `ml_max_total_assets` of that joint ranking.
+        #
+        # This previously trimmed only `additions`, against a budget of
+        # `ml_max_total_assets - len(core | previously_held)`. That budget is
+        # <= 0 whenever the core is larger than the cap, which is true on 97%
+        # of the dates in the shipped balanced PIT universe (core 53-208
+        # names, median 170, against a cap of 40) -- so `additions` was
+        # truncated to nothing and no admitted name ever entered the book on
+        # any rebalance of a full-history run. The entire signal stack was
+        # computed each week and discarded here, and the min-weight floor
+        # below never fired either, because every held name was a protected
+        # core name. See
+        # claude/retail_alpha_ml_mpc_additions_always_zero_and_slsqp_cost.md.
+        budget = max(int(self.config.ml_max_total_assets), 1)
+        # A name already held is a candidate for its own slot on the hold bar,
+        # not on the buy bar, and independently of `maximum_added_assets` --
+        # that cap sizes the *new-admission* shortlist, and letting it also
+        # gate re-selection would drop a perfectly good holding for no reason
+        # other than that this week's fresh top-N shortlist happened to be
+        # drawn from elsewhere in a noisy cross-section.
+        retained = (
+            previously_held.intersection(window.columns)
+            .difference(self._forced_exit_assets)
+            .difference(core)
         )
-        if len(additions) > available_for_additions:
-            additions = additions[:available_for_additions]
-
-        continuing = core.append(pd.Index(additions)).drop_duplicates()
+        if len(retained):
+            retained_scores = (
+                admission_score.reindex(retained).astype(float).fillna(-np.inf)
+            )
+            retained = retained[retained_scores.ge(hold_score).to_numpy()]
+        pool = (
+            core.append(pd.Index(additions))
+            .append(pd.Index(retained))
+            .drop_duplicates()
+        )
+        # `floor(max_sector_weight * budget)` is the largest intake that keeps
+        # a sector inside `max_sector_weight` at the floor weight of
+        # 1 / budget, but a book sitting exactly on that bound in every
+        # sector spans only `1 / max_sector_weight` sectors and leaves the
+        # optimizer no headroom at all (four sectors x 0.25 = 1.00, before
+        # style and participation limits are even considered). Take the
+        # tighter of that bound and `max_added_per_sector`, which is the
+        # diversification rule this file already applies to new admissions.
+        per_sector_cap = max(
+            1,
+            min(
+                int(np.floor(self.config.max_sector_weight * budget)),
+                int(self.config.max_added_per_sector),
+            ),
+        )
+        pool_scores = admission_score.reindex(pool).astype(float).fillna(-np.inf)
+        # Hysteresis, so a cap that now actually binds does not churn the book
+        # every week on small reshuffles of a noisy cross-sectional score:
+        # a name already held keeps its slot while it still clears the hold
+        # bar (`minimum_candidate_hold_score`, defaulting to
+        # `minimum_candidate_score`), and only the slots left over are opened
+        # to challengers. This is the same hold-vs-buy asymmetry the
+        # admission logic above already applies through `required_score`,
+        # carried into the trim; without it, every rebalance rewrites the
+        # whole book from a fresh ranking and the resulting forced-exit
+        # schedules pile up until the optimizer's own sector and
+        # participation constraints go infeasible.
+        incumbent_pool = previously_held.intersection(pool)
+        incumbent_scores = pool_scores.reindex(incumbent_pool)
+        incumbents_ranked = (
+            incumbent_scores[incumbent_scores.ge(hold_score).to_numpy()]
+            .sort_values(ascending=False, kind="stable")
+            .index
+        )
+        challengers_ranked = (
+            pool_scores.drop(index=incumbents_ranked, errors="ignore")
+            .sort_values(ascending=False, kind="stable")
+            .index
+        )
+        ranked_pool = incumbents_ranked.append(challengers_ranked)
+        kept: list[str] = []
+        kept_sector_counts: dict[str, int] = {}
+        for asset in ranked_pool:
+            if len(kept) >= budget:
+                break
+            sector = str(sectors.get(asset, "UNKNOWN"))
+            if kept_sector_counts.get(sector, 0) >= per_sector_cap:
+                continue
+            kept.append(asset)
+            kept_sector_counts[sector] = kept_sector_counts.get(sector, 0) + 1
+        continuing = pd.Index(kept)
         held_assets = previously_held
         exiting = held_assets.difference(continuing)
+        self.last_exit_assets = exiting.copy()
         selected = continuing.append(exiting).drop_duplicates()
+        if len(continuing) * self.config.max_weight < 1.0 - 1e-9 and not len(exiting):
+            raise ValueError(
+                f"max_weight={self.config.max_weight:.4f} across "
+                f"{len(continuing)} selected assets caps total investable weight "
+                f"at {len(continuing) * self.config.max_weight:.4f} (< 1.0). "
+                "Increase the selected universe or max_weight."
+            )
         selected_returns = window.loc[:, selected]
         selected_snapshot = snapshot.reindex(selected)
         selected_sectors = sectors.reindex(selected).fillna("UNKNOWN")
@@ -2483,6 +2723,10 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             omitted_weight = float(
                 live_previous.drop(index=selected, errors="ignore")
                 .clip(lower=0.0)
+                # Match prepare_allocation_window's existing dust policy.
+                # The engine retains these positions in current_w and books
+                # their actual sales, turnover and costs against a zero target.
+                .loc[lambda values: values > self._held_materiality_threshold]
                 .sum()
             )
             if omitted_weight > self.config.maximum_unrepresentable_weight:
@@ -2804,6 +3048,11 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
                 ] = trade_jacobian
                 row_start += 2 * asset_count
 
+            capacity_rows = _binding_capacity_rows(
+                lower_matrix, upper_matrix, previous_values, capacity_values, capacity_steps
+            )
+            capacity_jacobian = capacity_jacobian[capacity_rows]
+
             def capacity_constraint(flat: np.ndarray) -> np.ndarray:
                 path = unpack(flat)
                 values: list[np.ndarray] = []
@@ -2811,15 +3060,18 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
                     predecessor = previous_values if step == 0 else path[step - 1]
                     trade = path[step] - predecessor
                     values.extend([capacity_values - trade, capacity_values + trade])
-                return np.concatenate(values)
+                return np.concatenate(values)[capacity_rows]
 
-            constraints.append(
-                {
-                    "type": "ineq",
-                    "fun": capacity_constraint,
-                    "jac": lambda _flat: capacity_jacobian,
-                }
-            )
+            if capacity_rows.any():
+                constraints.append(
+                    {
+                        "type": "ineq",
+                        "fun": capacity_constraint,
+                        "jac": lambda _flat: capacity_jacobian,
+                    }
+                )
+        exposure_limit_relaxation = 0.0
+        first_exposure_constraint = len(constraints)
         for column in range(style_matrix.shape[1]):
             vector = style_matrix[:, column].copy()
             style_jacobian = np.zeros(
@@ -2834,6 +3086,7 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
                         "type": "ineq",
                         "fun": lambda flat, v=vector: (
                             self.config.max_absolute_style_exposure
+                            + exposure_limit_relaxation
                             - unpack(flat) @ v
                         ),
                         "jac": lambda _flat, j=style_jacobian: -j,
@@ -2842,6 +3095,7 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
                         "type": "ineq",
                         "fun": lambda flat, v=vector: (
                             self.config.max_absolute_style_exposure
+                            + exposure_limit_relaxation
                             + unpack(flat) @ v
                         ),
                         "jac": lambda _flat, j=style_jacobian: j,
@@ -2860,6 +3114,7 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
                     "type": "ineq",
                     "fun": lambda flat, p=positions: (
                         self.config.max_sector_weight
+                        + exposure_limit_relaxation
                         - unpack(flat)[:, p].sum(axis=1)
                     ),
                     "jac": lambda _flat, j=sector_jacobian: j,
@@ -2954,6 +3209,28 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
                 b_ub: list[np.ndarray] = []
                 a_eq: list[np.ndarray] = []
                 b_eq: list[np.ndarray] = []
+                ub_label_spans: list[tuple[int, int, str]] = []
+                _n_style = style_matrix.shape[1]
+                _has_capacity = (
+                    len(constraints) == 3 + 2 * _n_style + len(sector_members)
+                )
+
+                def _block_label(position: int) -> str:
+                    first_style = 3 if _has_capacity else 2
+                    if position == 2 and _has_capacity:
+                        return "capacity (per-step trade limit)"
+                    offset = position - first_style
+                    if offset < 2 * _n_style:
+                        return (
+                            f"style exposure {exposure_columns[offset // 2]}"
+                            f" ({'upper' if offset % 2 == 0 else 'lower'})"
+                        )
+                    sector_index = offset - 2 * _n_style
+                    if 0 <= sector_index < len(sector_labels):
+                        return f"sector cap {sector_labels[sector_index]}"
+                    return f"constraint#{position}"
+
+                _ub_cursor = 0
                 for position, constraint in enumerate(constraints):
                     if position == 1:  # nonlinear CVaR constraint
                         continue
@@ -2969,6 +3246,10 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
                     else:
                         a_ub.append(-jacobian)
                         b_ub.append(values_at_zero)
+                        ub_label_spans.append(
+                            (_ub_cursor, values_at_zero.size, _block_label(position))
+                        )
+                        _ub_cursor += values_at_zero.size
                 linear_feasible = linprog(
                     np.zeros_like(lower_flat),
                     A_ub=np.vstack(a_ub) if a_ub else None,
@@ -2978,6 +3259,94 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
                     bounds=flat_bounds,
                     method="highs",
                 )
+                if (
+                    not linear_feasible.success
+                    and self.config.allow_exposure_limit_relaxation
+                ):
+                    # Minimax relaxation: one nonnegative slack shared by every
+                    # sector/style row at every step. Budget, bounds, capacity,
+                    # and forced exits stay hard. CVaR is repaired separately.
+                    relaxable = np.concatenate([
+                        np.full(block.size, float(position >= first_exposure_constraint))
+                        for position, block in zip(
+                            [i for i, c in enumerate(constraints)
+                             if i != 1 and c["type"] != "eq"],
+                            b_ub,
+                            strict=True,
+                        )
+                    ])
+                    relaxed = linprog(
+                        np.r_[np.zeros_like(lower_flat), 1.0],
+                        A_ub=np.column_stack([np.vstack(a_ub), -relaxable]),
+                        b_ub=np.concatenate(b_ub),
+                        A_eq=np.column_stack([np.vstack(a_eq), np.zeros(sum(b.size for b in b_eq))]),
+                        b_eq=np.concatenate(b_eq),
+                        bounds=flat_bounds + [(0.0, None)],
+                        method="highs",
+                    )
+                    if relaxed.success:
+                        exposure_limit_relaxation = max(float(relaxed.x[-1]), 0.0)
+                        # Keep the matrix repair and callable constraints in sync.
+                        cursor = 0
+                        for block in b_ub:
+                            block += exposure_limit_relaxation * relaxable[cursor:cursor + block.size]
+                            cursor += block.size
+                        relaxed.x = relaxed.x[:-1]
+                        linear_feasible = relaxed
+                        logging.getLogger(__name__).warning(
+                            "Retail Alpha MPC at %s: infeasible exposure caps; "
+                            "minimum common additive relaxation=%.8f "
+                            "(sector limit=%.8f, absolute style limit=%.8f)",
+                            as_of, exposure_limit_relaxation,
+                            self.config.max_sector_weight + exposure_limit_relaxation,
+                            self.config.max_absolute_style_exposure + exposure_limit_relaxation,
+                        )
+                infeasibility_report: list[str] = []
+                if not linear_feasible.success:
+                    # Which constraints actually have to give, and by how
+                    # much: an elastic phase-1 over the same affine system,
+                    # every row (equalities split in two) carrying a
+                    # non-negative slack, minimising their total. Without
+                    # this the only thing the caller learns is "infeasible",
+                    # and with a concentrated book it is usually the style
+                    # caps or the budget, not the cap-vs-count arithmetic
+                    # below, that is binding.
+                    n_var = lower_flat.size
+                    A_ub_m = np.vstack(a_ub) if a_ub else np.zeros((0, n_var))
+                    b_ub_v = np.concatenate(b_ub) if b_ub else np.zeros(0)
+                    A_eq_m = np.vstack(a_eq) if a_eq else np.zeros((0, n_var))
+                    b_eq_v = np.concatenate(b_eq) if b_eq else np.zeros(0)
+                    n_ub, n_eq = A_ub_m.shape[0], A_eq_m.shape[0]
+                    rows = np.vstack([A_ub_m, A_eq_m, -A_eq_m])
+                    rhs = np.concatenate([b_ub_v, b_eq_v, -b_eq_v])
+                    n_s = rows.shape[0]
+                    elastic = linprog(
+                        np.concatenate([np.zeros(n_var), np.ones(n_s)]),
+                        A_ub=np.hstack([rows, -np.eye(n_s)]),
+                        b_ub=rhs,
+                        bounds=flat_bounds + [(0.0, None)] * n_s,
+                        method="highs",
+                    )
+                    if elastic.success:
+                        slack = np.asarray(elastic.x[n_var:], dtype=float)
+                        for row_start, size, label in ub_label_spans:
+                            worst = float(
+                                np.abs(slack[row_start : row_start + size]).max()
+                            )
+                            if worst > 1e-9:
+                                infeasibility_report.append(
+                                    f"{label} binding by {worst:.4f}"
+                                )
+                        budget_slack = float(
+                            np.abs(slack[n_ub : n_ub + 2 * n_eq]).max()
+                        ) if n_eq else 0.0
+                        if budget_slack > 1e-9:
+                            infeasibility_report.append(
+                                f"elastic diagnostic requires a fully-invested "
+                                f"budget residual of {budget_slack:.4f}; this is "
+                                f"a joint minimum-slack diagnostic, not a maximum "
+                                f"investable-weight bound"
+                            )
                 if not linear_feasible.success:
                     asset_cap_bound = asset_count * self.config.max_weight
                     sector_cap_bound = (
@@ -2999,6 +3368,37 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
                             f"({', '.join(sector_labels)}) caps total investable "
                             f"weight at {sector_cap_bound:.4f} (< 1.0)"
                         )
+                    # Forced-exit positions enter the solve pinned to their
+                    # capacity-limited liquidation schedule (lower == upper),
+                    # so their weight is exogenous: no choice of the free
+                    # names can offset it. If the pinned weight in one sector
+                    # already exceeds `max_sector_weight`, or the pinned
+                    # weights alone overshoot the budget, the program is
+                    # infeasible for a reason no cap-vs-count arithmetic
+                    # above can show. Name it explicitly.
+                    for step in range(horizon):
+                        floor_row = lower_matrix[step]
+                        for label, positions in zip(sector_labels, sector_members):
+                            forced = float(floor_row[positions].sum())
+                            if forced > self.config.max_sector_weight + 1e-9:
+                                diagnostics.append(
+                                    f"forced-exit schedules alone put "
+                                    f"{forced:.4f} of the book in sector {label} "
+                                    f"at step {step}, above "
+                                    f"max_sector_weight="
+                                    f"{self.config.max_sector_weight:.4f}; these "
+                                    f"weights are pinned to a capacity-limited "
+                                    f"liquidation path and cannot be traded away "
+                                    f"any faster"
+                                )
+                        budget_floor = float(floor_row.sum())
+                        if budget_floor > 1.0 + 1e-9:
+                            diagnostics.append(
+                                f"forced-exit schedules alone require "
+                                f"{budget_floor:.4f} of capital at step {step}, "
+                                f"above a fully-invested book"
+                            )
+                    diagnostics.extend(infeasibility_report)
                     if not diagnostics:
                         diagnostics.append(
                             "no single cap (max_weight x count, max_sector_weight x "
@@ -3126,10 +3526,41 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
         pre_floor = final
         final = _apply_min_weight_floor(
             pre_floor,
-            1.0 / max(int(self.config.ml_max_total_assets), 1),
+            (
+                float(self.config.ml_min_weight)
+                if self.config.ml_min_weight is not None
+                else 1.0 / max(int(self.config.ml_max_total_assets), 1)
+            ),
             upper_bound_series,
-            protected=self._forced_exit_assets.union(core),
+            protected=self._forced_exit_assets.union(exiting),
         )
+        if not self.config.ml_equal_weight_benchmark:
+            floor_path = planned.copy()
+            floor_path[0] = final.to_numpy(dtype=float)
+            # A box-simplex projection alone does not preserve sector/style,
+            # exit, participation, or next-step trade constraints. Retain the
+            # solved portfolio if this optional cleanup breaks any of them.
+            floor_flat = floor_path.ravel()
+            floor_valid = (
+                np.isfinite(floor_flat).all()
+                and np.all(floor_path >= lower_matrix - 1e-7)
+                and np.all(floor_path <= upper_matrix + 1e-7)
+            )
+            for position, constraint in enumerate(constraints):
+                values = np.asarray(constraint["fun"](floor_flat), dtype=float)
+                if position == 1:
+                    values = values + effective_cvar_limit - self.config.weekly_cvar_95_limit
+                floor_valid = floor_valid and bool(
+                    np.isfinite(values).all()
+                    and (
+                        np.all(np.abs(values) <= 1e-7)
+                        if constraint["type"] == "eq"
+                        else np.all(values >= -1e-7)
+                    )
+                )
+            if not floor_valid:
+                final = pre_floor
+        planned[0] = final.to_numpy(dtype=float)
         pruned_mask = (pre_floor > _EPS) & (final <= _EPS)
         self.last_pruned_dust_assets = pre_floor.index[pruned_mask.to_numpy(dtype=bool)]
 
@@ -3216,6 +3647,7 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             optimizer_success=optimizer_success,
             optimizer_repaired=optimizer_repaired,
             risk_limit_relaxed=risk_limit_relaxed,
+            exposure_limit_relaxation=exposure_limit_relaxation,
             effective_weekly_cvar_limit=effective_cvar_limit,
             unrepresentable_exit_weight=omitted_weight if has_previous else 0.0,
             signal_weights=signal_weights.to_dict(),

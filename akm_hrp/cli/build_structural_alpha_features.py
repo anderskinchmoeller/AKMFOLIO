@@ -87,7 +87,16 @@ def build_structural_features(
         if raw.empty:
             continue
         current_start = raw["date"].min()
-        panel = pd.concat([trailing, raw], ignore_index=True)
+        # trailing starts as an empty, dtype-less placeholder on the first
+        # iteration. Concatenating it with a real, properly-dtyped frame
+        # triggers pandas' FutureWarning about upcoming changes to how
+        # empty/all-NA concat participants affect result dtype inference.
+        # Excluding the empty placeholder (pandas' own suggested remedy)
+        # is behavior-identical here: on every later iteration trailing is
+        # a real, non-empty tail-slice, so this only changes iteration 1.
+        panel = raw.copy() if trailing.empty else pd.concat(
+            [trailing, raw], ignore_index=True
+        )
         panel["permno"] = panel["permno"].astype(str)
         panel["date"] = pd.to_datetime(panel["date"], errors="coerce")
         panel = panel.loc[panel["date"].notna()]

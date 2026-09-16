@@ -5,11 +5,12 @@ class HRPConfig:
     returns_file: str = "weekly_returns.csv"
     lookback_years: int = 5
     lookback_weeks: int = 260
-    max_weight: float = 0.1
+    max_weight: float = 0.2
     min_weight: float = 0.01
     risk_free_rate: float = 0.00
     min_history_weeks: int = 52
-    min_window_obs: int = 26
+    # Require a full year of observations inside the estimation window.
+    min_window_obs: int = 52
     cov_max_interior_missing_fraction: float = 0.05
 
     # Realistic implementation controls.  Turnover is L1 weight change, so a
@@ -29,13 +30,16 @@ class HRPConfig:
 
     cpcv_n_groups: int = 6
     cpcv_test_groups: int = 2
-    cpcv_group_weeks: int = 52
-    cpcv_purge_weeks: int = 1
-    cpcv_embargo_weeks: int = 1
-    # The HRP allocator is estimated walk-forward and has no trainable global
-    # state, so one chronological run can be scored across all CPCV paths.
-    # Enable only for an allocator_factory that genuinely fits on train rows.
-    cpcv_refit_per_split: bool = False
+    # Broad-history research preset: 30 years across 15 train/test splits.
+    # Requires at least 1,560 weekly observations in the supplied CV data.
+    cpcv_group_weeks: int = 104
+    # Four-week boundary buffers are a sensitivity baseline, not a substitute
+    # for rejecting labels whose formation/realization intervals cross splits.
+    cpcv_purge_weeks: int = 4
+    cpcv_embargo_weeks: int = 4
+    # Auto restricts online learners to split training labels. False is only
+    # valid for shared-path resampling of non-learning allocators.
+    cpcv_refit_per_split: bool | None = None
 
     lw_alpha: float = 0.05
     lw_n_bootstraps: int = 4999

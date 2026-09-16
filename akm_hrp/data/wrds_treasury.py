@@ -1,365 +1,216 @@
-# from __future__ import annotations
-#
-# import re
-# from dataclasses import dataclass
-# from datetime import date
-# from typing import Any
-#
-# import numpy as np
-# import pandas as pd
-#
-# CRSP_FIXED_TERM_SERIES = {
-#     2_000_003: "CRSP_TSY_1Y",
-#     2_000_005: "CRSP_TSY_5Y",
-#     2_000_007: "CRSP_TSY_10Y",
-#     2_000_009: "CRSP_TSY_30Y",
-# }
-#
-#
-# @dataclass(frozen=True)
-# class CRSPTreasuryQueryConfig:
-#     """WRDS locations used for CRSP daily fixed-term Treasury indexes."""
-#
-#     library: str | None = None
-#     preferred_libraries: tuple[str, ...] = (
-#         "crsp_m_treasuries",
-#         "crsp_q_treasuries",
-#         "crsp_a_treasuries",
-#     )
-#     preferred_tables: tuple[str, ...] = ("tfz_dly_ft",)
-#
-#
-# def _safe_identifier(value: str) -> str:
-#     text = str(value)
-#     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text):
-#         raise ValueError(f"Unsafe SQL identifier: {value!r}")
-#     return text
-#
-#
-# def _description_columns(description: Any) -> list[str]:
-#     if isinstance(description, pd.DataFrame):
-#         for candidate in ("name", "column_name", "variable"):
-#             if candidate in description.columns:
-#                 return description[candidate].astype(str).tolist()
-#     if isinstance(description, (list, tuple)):
-#         columns = [
-#             str(item.get("name") or item.get("column_name"))
-#             if isinstance(item, dict)
-#             else str(item)
-#             for item in description
-#         ]
-#         return [column for column in columns if column and column != "None"]
-#     raise TypeError("Unsupported WRDS table description format.")
-#
-#
-# def resolve_crsp_treasury_table(
-#     connection: Any,
-#     config: CRSPTreasuryQueryConfig | None = None,
-# ) -> tuple[str, str, dict[str, str]]:
-#     """Locate the licensed CRSP daily fixed-term Treasury index table."""
-#
-#     cfg = config or CRSPTreasuryQueryConfig()
-#     available_libraries = {
-#         str(name).lower(): str(name) for name in connection.list_libraries()
-#     }
-#     requested = (cfg.library,) if cfg.library else cfg.preferred_libraries
-#     libraries = [
-#         available_libraries[name.lower()]
-#         for name in requested
-#         if name and name.lower() in available_libraries
-#     ]
-#     if not libraries:
-#         expected = (cfg.library,) if cfg.library else cfg.preferred_libraries
-#         raise RuntimeError(
-#             "No licensed CRSP Treasury schema is accessible. Expected one of: "
-#             + ", ".join(str(name) for name in expected)
-#         )
-#
-#     for library in libraries:
-#         tables = {
-#             str(name).lower(): str(name)
-#             for name in connection.list_tables(library=library)
-#         }
-#         for preferred in cfg.preferred_tables:
-#             table = tables.get(preferred.lower())
-#             if table is None:
-#                 continue
-#             description = connection.describe_table(library=library, table=table)
-#             lookup = {name.lower(): name for name in _description_columns(description)}
-#             return_field = lookup.get("tdretadj") or lookup.get("tdretnua")
-#             required = {
-#                 "treasnox": lookup.get("treasnox"),
-#                 "date": lookup.get("caldt"),
-#                 "return": return_field,
-#             }
-#             missing = [key for key, value in required.items() if value is None]
-#             if missing:
-#                 raise RuntimeError(
-#                     f"{library}.{table} is missing Treasury fields: {missing}."
-#                 )
-#             resolved = {key: str(value) for key, value in required.items()}
-#             return library, table, resolved
-#     raise RuntimeError(
-#         "No TFZ_DLY_FT table is accessible in the licensed CRSP Treasury schemas."
-#     )
-#
-#
-# def fetch_crsp_fixed_term_daily(
-#     connection: Any,
-#     start: str | date,
-#     end: str | date,
-#     *,
-#     series: dict[int, str] | None = None,
-#     config: CRSPTreasuryQueryConfig | None = None,
-# ) -> pd.DataFrame:
-#     """Fetch CRSP fixed-term Treasury daily returns as decimal returns."""
-#
-#     first = pd.Timestamp(start).normalize()
-#     last = pd.Timestamp(end).normalize()
-#     if first > last:
-#         raise ValueError("start must be on or before end.")
-#
-#     requested = dict(series or CRSP_FIXED_TERM_SERIES)
-#     if not requested:
-#         raise ValueError("At least one CRSP TREASNOX series is required.")
-#     if len(set(requested.values())) != len(requested):
-#         raise ValueError("Treasury output names must be unique.")
-#     library, table, columns = resolve_crsp_treasury_table(connection, config)
-#     safe_library = _safe_identifier(library)
-#     safe_table = _safe_identifier(table)
-#     placeholders: list[str] = []
-#     params: dict[str, object] = {
-#         "start": first.date().isoformat(),
-#         "end": last.date().isoformat(),
-#     }
-#     for number, identifier in enumerate(requested):
-#         if int(identifier) != identifier:
-#             raise ValueError(f"TREASNOX must be an integer: {identifier!r}")
-#         parameter = f"series_{number}"
-#         params[parameter] = int(identifier)
-#         placeholders.append(f"%({parameter})s")
-#     query = (
-#         f"SELECT {_safe_identifier(columns['treasnox'])} AS treasnox, "
-#         f"{_safe_identifier(columns['date'])} AS date, "
-#         f"{_safe_identifier(columns['return'])} AS raw_return "
-#         f"FROM {safe_library}.{safe_table} "
-#         f"WHERE {_safe_identifier(columns['date'])} BETWEEN %(start)s AND %(end)s "
-#         f"AND {_safe_identifier(columns['treasnox'])} IN ({', '.join(placeholders)}) "
-#         f"ORDER BY {_safe_identifier(columns['treasnox'])}, "
-#         f"{_safe_identifier(columns['date'])}"
-#     )
-#     daily = connection.raw_sql(query, params=params, date_cols=["date"])
-#     if daily.empty:
-#         raise ValueError("CRSP fixed-term Treasury query returned no rows.")
-#     daily = daily.copy()
-#     daily["date"] = pd.to_datetime(daily["date"], errors="raise")
-#     daily["treasnox"] = pd.to_numeric(daily["treasnox"], errors="raise").astype("int64")
-#     returned_series = set(daily["treasnox"].unique())
-#     missing_series = sorted(set(requested).difference(returned_series))
-#     if missing_series:
-#         raise ValueError(
-#             f"WRDS returned no rows for requested TREASNOX values: {missing_series}"
-#         )
-#     raw = pd.to_numeric(daily["raw_return"], errors="coerce")
-#     if str(columns["return"]).lower() == "tdretadj":
-#         # TDRETADJ is TDRETNUA * 100 and is therefore a percentage.
-#         raw = raw.mask(raw <= -100.0) / 100.0
-#     else:
-#         # TDRETNUA uses -99 as its missing-value sentinel.
-#         raw = raw.mask(raw <= -1.0)
-#     daily["ret"] = raw.replace([np.inf, -np.inf], np.nan)
-#     if (daily["ret"].dropna() < -1.0).any():
-#         raise ValueError("CRSP Treasury returns below -100% were found.")
-#     daily["asset"] = daily["treasnox"].map(requested)
-#     if daily["asset"].isna().any():
-#         raise ValueError("WRDS returned an unrequested TREASNOX series.")
-#     if daily.duplicated(["date", "asset"]).any():
-#         raise ValueError("CRSP Treasury data contains duplicate series-date rows.")
-#     source_metadata = {
-#         "wrds_library": library,
-#         "wrds_table": table,
-#         "return_field": columns["return"],
-#     }
-#     daily.attrs.update(source_metadata)
-#     result = daily[["date", "treasnox", "asset", "ret"]].sort_values(["date", "asset"])
-#     result.attrs.update(source_metadata)
-#     return result
-#
-#
-# def build_crsp_treasury_weekly(daily: pd.DataFrame) -> pd.DataFrame:
-#     """Compound complete CRSP daily Treasury series to Friday weeks."""
-#
-#     required = {"date", "asset", "ret"}
-#     missing = required.difference(daily.columns)
-#     if missing:
-#         raise ValueError(f"Treasury daily data is missing columns: {sorted(missing)}")
-#     values = daily.copy()
-#     values["date"] = pd.to_datetime(values["date"], errors="raise")
-#     values["asset"] = values["asset"].astype(str)
-#     values["ret"] = pd.to_numeric(values["ret"], errors="coerce")
-#     if values.empty:
-#         raise ValueError("Treasury daily data contains no rows.")
-#     if (values["ret"].dropna() < -1.0).any():
-#         raise ValueError("Treasury daily returns below -100% were found.")
-#     panel = values.pivot(index="date", columns="asset", values="ret").sort_index()
-#     valid = panel.notna()
-#     interior = (~valid) & valid.cummax() & valid.iloc[::-1].cummax().iloc[::-1]
-#     affected = interior.any(axis=0)
-#     if affected.any():
-#         raise ValueError(
-#             "CRSP Treasury series contain interior daily gaps: "
-#             f"{affected[affected].index.tolist()}"
-#         )
-#     weekly = (1.0 + panel).resample("W-FRI").prod(min_count=1) - 1.0
-#     weekly.index.name = "date"
-#     weekly.attrs.update(getattr(daily, "attrs", {}))
-#     return weekly
-
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+from datetime import date
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
-# Standard CRSP TREASNOX / Fixed-Term Index identifiers mapping
-CRSP_FIXED_TERM_SERIES: Dict[int, str] = {
-    2000001: "1Y",  # 1-Year Treasury Fixed Term Index
-    2000005: "5Y",  # 5-Year Treasury Fixed Term Index
-    2000010: "10Y", # 10-Year Treasury Fixed Term Index
-    2000030: "30Y", # 30-Year Treasury Fixed Term Index
+CRSP_FIXED_TERM_SERIES = {
+    2_000_003: "CRSP_TSY_1Y",
+    2_000_005: "CRSP_TSY_5Y",
+    2_000_007: "CRSP_TSY_10Y",
+    2_000_009: "CRSP_TSY_30Y",
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class CRSPTreasuryQueryConfig:
-    library: Optional[str] = None
-    table: str = "tfz_dly_ft"
+    """WRDS locations used for CRSP daily fixed-term Treasury indexes."""
+
+    library: str | None = None
+    preferred_libraries: tuple[str, ...] = (
+        "crsp_m_treasuries",
+        "crsp_q_treasuries",
+        "crsp_a_treasuries",
+    )
+    preferred_tables: tuple[str, ...] = ("tfz_dly_ft",)
+
+
+def _safe_identifier(value: str) -> str:
+    text = str(value)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text):
+        raise ValueError(f"Unsafe SQL identifier: {value!r}")
+    return text
+
+
+def _description_columns(description: Any) -> list[str]:
+    if isinstance(description, pd.DataFrame):
+        for candidate in ("name", "column_name", "variable"):
+            if candidate in description.columns:
+                return description[candidate].astype(str).tolist()
+    if isinstance(description, (list, tuple)):
+        columns = [
+            str(item.get("name") or item.get("column_name"))
+            if isinstance(item, dict)
+            else str(item)
+            for item in description
+        ]
+        return [column for column in columns if column and column != "None"]
+    raise TypeError("Unsupported WRDS table description format.")
 
 
 def resolve_crsp_treasury_table(
-    connection: Any, config: CRSPTreasuryQueryConfig
-) -> Tuple[str, str, Dict[str, str]]:
-    """
-    Dynamically inspects WRDS schema to find the correct library, table, 
-    and column mappings for CRSP Fixed-Term Treasury indices.
-    """
-    candidate_libraries = (
-        [config.library] if config.library else ["crsp_a_treasuries", "crsp_q_treasuries", "crsp"]
-    )
-    
-    target_library = None
-    target_table = config.table
-    existing_cols: List[str] = []
+    connection: Any,
+    config: CRSPTreasuryQueryConfig | None = None,
+) -> tuple[str, str, dict[str, str]]:
+    """Locate the licensed CRSP daily fixed-term Treasury index table."""
 
-    for lib in candidate_libraries:
-        query = f"""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_schema = '{lib}' 
-              AND table_name = '{target_table}'
-        """
-        try:
-            col_df = connection.raw_sql(query)
-            if not col_df.empty:
-                target_library = lib
-                existing_cols = col_df["column_name"].str.lower().tolist()
-                break
-        except Exception:
-            continue
-
-    if not target_library:
-        raise RuntimeError(
-            f"Could not locate table '{target_table}' in candidate libraries: {candidate_libraries}."
-        )
-
-    # Expanded candidate mappings to cover crsp_a_treasuries layout
-    candidate_maps = {
-        "date": ["caldt", "date", "dldat"],
-        "id": ["kytreasnox", "kytreasidx", "treasnox", "treas_idx", "permno"],
-        "return": ["tdretadj", "tret", "tdret", "ret", "tm_ret"],
+    cfg = config or CRSPTreasuryQueryConfig()
+    available_libraries = {
+        str(name).lower(): str(name) for name in connection.list_libraries()
     }
-
-    resolved_cols: Dict[str, str] = {}
-    missing_fields = []
-
-    for key, candidates in candidate_maps.items():
-        found = next((c for c in candidates if c in existing_cols), None)
-        if found:
-            resolved_cols[key] = found
-        else:
-            missing_fields.append(f"{key} (candidates: {candidates})")
-
-    if missing_fields:
+    requested = (cfg.library,) if cfg.library else cfg.preferred_libraries
+    libraries = [
+        available_libraries[name.lower()]
+        for name in requested
+        if name and name.lower() in available_libraries
+    ]
+    if not libraries:
+        expected = (cfg.library,) if cfg.library else cfg.preferred_libraries
         raise RuntimeError(
-            f"Table {target_library}.{target_table} is missing Treasury fields: {missing_fields}. "
-            f"Available columns: {sorted(existing_cols)}"
+            "No licensed CRSP Treasury schema is accessible. Expected one of: "
+            + ", ".join(str(name) for name in expected)
         )
 
-    return target_library, target_table, resolved_cols
+    for library in libraries:
+        tables = {
+            str(name).lower(): str(name)
+            for name in connection.list_tables(library=library)
+        }
+        for preferred in cfg.preferred_tables:
+            table = tables.get(preferred.lower())
+            if table is None:
+                continue
+            description = connection.describe_table(library=library, table=table)
+            lookup = {name.lower(): name for name in _description_columns(description)}
+            return_field = lookup.get("tdretadj") or lookup.get("tdretnua")
+            required = {
+                "treasnox": lookup.get("treasnox"),
+                "date": lookup.get("caldt"),
+                "return": return_field,
+            }
+            missing = [key for key, value in required.items() if value is None]
+            if missing:
+                raise RuntimeError(
+                    f"{library}.{table} is missing Treasury fields: {missing}."
+                )
+            resolved = {key: str(value) for key, value in required.items()}
+            return library, table, resolved
+    raise RuntimeError(
+        "No TFZ_DLY_FT table is accessible in the licensed CRSP Treasury schemas."
+    )
 
 
 def fetch_crsp_fixed_term_daily(
     connection: Any,
-    start_date: str,
-    end_date: str,
-    series: Dict[int, str],
-    config: Optional[CRSPTreasuryQueryConfig] = None,
+    start: str | date,
+    end: str | date,
+    *,
+    series: dict[int, str] | None = None,
+    config: CRSPTreasuryQueryConfig | None = None,
 ) -> pd.DataFrame:
-    """
-    Queries WRDS for daily fixed-term Treasury series and returns a wide DataFrame of returns.
-    """
-    if config is None:
-        config = CRSPTreasuryQueryConfig()
+    """Fetch CRSP fixed-term Treasury daily returns as decimal returns."""
 
-    library, table, col_map = resolve_crsp_treasury_table(connection, config)
+    first = pd.Timestamp(start).normalize()
+    last = pd.Timestamp(end).normalize()
+    if first > last:
+        raise ValueError("start must be on or before end.")
 
-    date_col = col_map["date"]
-    id_col = col_map["id"]
-    ret_col = col_map["return"]
-
-    series_ids_str = ",".join(map(str, series.keys()))
-
-    query = f"""
-        SELECT 
-            {date_col} AS date,
-            {id_col} AS series_id,
-            {ret_col} AS tret
-        FROM {library}.{table}
-        WHERE {date_col} BETWEEN '{start_date}' AND '{end_date}'
-          AND {id_col} IN ({series_ids_str})
-    """
-
-    df = connection.raw_sql(query, date_cols=["date"])
-
-    if df.empty:
+    requested = dict(series or CRSP_FIXED_TERM_SERIES)
+    if not requested:
+        raise ValueError("At least one CRSP TREASNOX series is required.")
+    if len(set(requested.values())) != len(requested):
+        raise ValueError("Treasury output names must be unique.")
+    library, table, columns = resolve_crsp_treasury_table(connection, config)
+    safe_library = _safe_identifier(library)
+    safe_table = _safe_identifier(table)
+    placeholders: list[str] = []
+    params: dict[str, object] = {
+        "start": first.date().isoformat(),
+        "end": last.date().isoformat(),
+    }
+    for number, identifier in enumerate(requested):
+        if int(identifier) != identifier:
+            raise ValueError(f"TREASNOX must be an integer: {identifier!r}")
+        parameter = f"series_{number}"
+        params[parameter] = int(identifier)
+        placeholders.append(f"%({parameter})s")
+    query = (
+        f"SELECT {_safe_identifier(columns['treasnox'])} AS treasnox, "
+        f"{_safe_identifier(columns['date'])} AS date, "
+        f"{_safe_identifier(columns['return'])} AS raw_return "
+        f"FROM {safe_library}.{safe_table} "
+        f"WHERE {_safe_identifier(columns['date'])} BETWEEN %(start)s AND %(end)s "
+        f"AND {_safe_identifier(columns['treasnox'])} IN ({', '.join(placeholders)}) "
+        f"ORDER BY {_safe_identifier(columns['treasnox'])}, "
+        f"{_safe_identifier(columns['date'])}"
+    )
+    daily = connection.raw_sql(query, params=params, date_cols=["date"])
+    if daily.empty:
+        raise ValueError("CRSP fixed-term Treasury query returned no rows.")
+    daily = daily.copy()
+    daily["date"] = pd.to_datetime(daily["date"], errors="raise")
+    daily["treasnox"] = pd.to_numeric(daily["treasnox"], errors="raise").astype("int64")
+    returned_series = set(daily["treasnox"].unique())
+    missing_series = sorted(set(requested).difference(returned_series))
+    if missing_series:
         raise ValueError(
-            f"No Treasury data returned for query from {start_date} to {end_date} in {library}.{table}."
+            f"WRDS returned no rows for requested TREASNOX values: {missing_series}"
         )
+    raw = pd.to_numeric(daily["raw_return"], errors="coerce")
+    if str(columns["return"]).lower() == "tdretadj":
+        # TDRETADJ is TDRETNUA * 100 and is therefore a percentage.
+        raw = raw.mask(raw <= -100.0) / 100.0
+    else:
+        # TDRETNUA uses -99 as its missing-value sentinel.
+        raw = raw.mask(raw <= -1.0)
+    daily["ret"] = raw.replace([np.inf, -np.inf], np.nan)
+    if (daily["ret"].dropna() < -1.0).any():
+        raise ValueError("CRSP Treasury returns below -100% were found.")
+    daily["asset"] = daily["treasnox"].map(requested)
+    if daily["asset"].isna().any():
+        raise ValueError("WRDS returned an unrequested TREASNOX series.")
+    if daily.duplicated(["date", "asset"]).any():
+        raise ValueError("CRSP Treasury data contains duplicate series-date rows.")
+    source_metadata = {
+        "wrds_library": library,
+        "wrds_table": table,
+        "return_field": columns["return"],
+    }
+    daily.attrs.update(source_metadata)
+    result = daily[["date", "treasnox", "asset", "ret"]].sort_values(["date", "asset"])
+    result.attrs.update(source_metadata)
+    return result
 
-    # Convert series IDs to clean column labels (e.g. 2000001 -> '1Y')
-    df["series_name"] = df["series_id"].map(series)
-    
-    # Clean numeric returns
-    df["tret"] = pd.to_numeric(df["tret"], errors="coerce").fillna(0.0)
 
-    # Pivot into Wide Daily Matrix (Date x Series)
-    daily_matrix = df.pivot(index="date", columns="series_name", values="tret")
-    daily_matrix.index = pd.to_datetime(daily_matrix.index)
-    daily_matrix = daily_matrix.sort_index()
+def build_crsp_treasury_weekly(daily: pd.DataFrame) -> pd.DataFrame:
+    """Compound complete CRSP daily Treasury series to Friday weeks."""
 
-    # Store query metadata on the DataFrame attributes for CLI manifest generation
-    daily_matrix.attrs["wrds_library"] = library
-    daily_matrix.attrs["wrds_table"] = table
-    daily_matrix.attrs["return_field"] = ret_col
-
-    return daily_matrix
-
-
-def build_crsp_treasury_weekly(daily_matrix: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compounds daily Treasury returns into Friday-ending weekly returns:
-    R_weekly = Prod(1 + R_daily) - 1
-    """
-    weekly_returns = daily_matrix.resample("W-FRI").apply(lambda x: np.prod(1.0 + x) - 1.0)
-    return weekly_returns.dropna(how="all")
+    required = {"date", "asset", "ret"}
+    missing = required.difference(daily.columns)
+    if missing:
+        raise ValueError(f"Treasury daily data is missing columns: {sorted(missing)}")
+    values = daily.copy()
+    values["date"] = pd.to_datetime(values["date"], errors="raise")
+    values["asset"] = values["asset"].astype(str)
+    values["ret"] = pd.to_numeric(values["ret"], errors="coerce")
+    if values.empty:
+        raise ValueError("Treasury daily data contains no rows.")
+    if (values["ret"].dropna() < -1.0).any():
+        raise ValueError("Treasury daily returns below -100% were found.")
+    panel = values.pivot(index="date", columns="asset", values="ret").sort_index()
+    valid = panel.notna()
+    interior = (~valid) & valid.cummax() & valid.iloc[::-1].cummax().iloc[::-1]
+    affected = interior.any(axis=0)
+    if affected.any():
+        raise ValueError(
+            "CRSP Treasury series contain interior daily gaps: "
+            f"{affected[affected].index.tolist()}"
+        )
+    weekly = (1.0 + panel).resample("W-FRI").prod(min_count=1) - 1.0
+    weekly.index.name = "date"
+    weekly.attrs.update(getattr(daily, "attrs", {}))
+    return weekly

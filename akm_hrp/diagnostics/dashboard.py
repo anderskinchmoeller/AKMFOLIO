@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -127,6 +128,111 @@ def export_backtest_dashboard(
     evaluation_start: pd.Timestamp | str | None = None,
     ticker_map: Mapping[str, str] | None = None,
 ) -> dict[str, Path]:
+    """Export the full period plus one dashboard per computed focus-model year.
+
+    Original paths and ``pdf``/``png`` keys are preserved. Annual files append
+    ``_YYYY`` before the extension and use keys such as ``pdf_2024``. Years
+    follow evaluation_start filtering and include partial years. Annual panels
+    use only that calendar year's observations; rolling Sharpe needs a full
+    window within that year. Comparisons without observations are omitted.
+    """
+    options = dict(
+        focus_model=focus_model, tc_bps=tc_bps, lookback_weeks=lookback_weeks,
+        rolling_sharpe_years=rolling_sharpe_years, heatmap_assets=heatmap_assets,
+        ticker_map=ticker_map,
+    )
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    combined_path = (
+        Path(output_pdf).with_name(f"{Path(output_pdf).stem}_combined.pdf")
+        if output_pdf is not None
+        else None
+    )
+    if combined_path is not None:
+        combined_path.parent.mkdir(parents=True, exist_ok=True)
+    with PdfPages(combined_path) if combined_path is not None else _NullPages() as pages:
+        pages_arg = pages if combined_path is not None else None
+        artifacts = _export_dashboard_period(
+            results, output_pdf=output_pdf, output_png=output_png, title=title,
+            evaluation_start=evaluation_start, pdf_pages=pages_arg, **options,
+        )
+        artifacts.update(
+            _export_annual_dashboards(
+                results, output_pdf=output_pdf, output_png=output_png,
+                title=title, evaluation_start=evaluation_start,
+                pdf_pages=pages_arg, options=options,
+            )
+        )
+    if combined_path is not None:
+        artifacts["pdf_combined"] = combined_path
+    return artifacts
+
+
+class _NullPages:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _export_annual_dashboards(
+    results, *, output_pdf, output_png, title, evaluation_start, pdf_pages, options
+) -> dict[str, Path]:
+    artifacts: dict[str, Path] = {}
+    focus_model = options["focus_model"]
+    tc_bps = options["tc_bps"]
+    start = pd.Timestamp(evaluation_start) if evaluation_start is not None else None
+    focus_returns = _after(_result_returns(results[focus_model]), start)
+    for year in sorted(focus_returns.index.year.unique()):
+        def in_year(series):
+            filtered = _after(series, start)
+            return filtered.loc[filtered.index.year == year]
+
+        annual_results = {}
+        for name, result in results.items():
+            returns = in_year(_result_returns(result))
+            if returns.empty:
+                continue
+            annual_results[name] = SimpleNamespace(
+                portfolio_returns=returns,
+                weights=in_year(pd.DataFrame(result.weights)),
+                # Compute legacy costs before slicing to retain year-boundary trades.
+                transaction_costs=in_year(_result_transaction_costs(result, tc_bps)),
+            )
+
+        def annual_path(path):
+            if path is None:
+                return None
+            path = Path(path)
+            return path.with_name(f"{path.stem}_{year}{path.suffix}")
+
+        annual = _export_dashboard_period(
+            annual_results, output_pdf=annual_path(output_pdf),
+            output_png=annual_path(output_png),
+            title=f"{title or model_display_name(focus_model) + ' Research Dashboard'} - {year}",
+            pdf_pages=pdf_pages,
+            **options,
+        )
+        artifacts.update({f"{kind}_{year}": path for kind, path in annual.items()})
+    return artifacts
+
+
+def _export_dashboard_period(
+    results: Mapping[str, Any],
+    *,
+    focus_model: str,
+    output_pdf: str | Path | None = None,
+    output_png: str | Path | None = None,
+    title: str | None = None,
+    tc_bps: float = 10.0,
+    lookback_weeks: int = 260,
+    rolling_sharpe_years: int = 3,
+    heatmap_assets: int = 15,
+    evaluation_start: pd.Timestamp | str | None = None,
+    ticker_map: Mapping[str, str] | None = None,
+    pdf_pages: Any | None = None,
+) -> dict[str, Path]:
     """Export a model-agnostic research dashboard from walk-forward results.
 
     Every panel is computed from the supplied ``BacktestResult`` objects. This
@@ -140,7 +246,7 @@ def export_backtest_dashboard(
         raise ValueError(
             f"Dashboard focus model {focus_model!r} is not in {sorted(results)}."
         )
-    if output_pdf is None and output_png is None:
+    if output_pdf is None and output_png is None and pdf_pages is None:
         raise ValueError("Set output_pdf, output_png, or both.")
     if rolling_sharpe_years < 1:
         raise ValueError("rolling_sharpe_years must be at least 1.")
@@ -345,6 +451,8 @@ def export_backtest_dashboard(
             png_path.parent.mkdir(parents=True, exist_ok=True)
             figure.savefig(png_path, dpi=180, bbox_inches="tight", metadata=metadata)
             artifacts["png"] = png_path
+        if pdf_pages is not None:
+            pdf_pages.savefig(figure, bbox_inches="tight")
         plt.close(figure)
 
     return artifacts

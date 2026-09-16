@@ -38,6 +38,8 @@ class BacktestResult:
     metrics: dict[str, float]
     transaction_costs: pd.Series | None = None
     ending_weights: pd.Series | None = None
+    diagnostics: pd.DataFrame | None = None
+    validation_mode: str = "chronological_walk_forward"
 
     # Compatibility aliases for older callers.
     @property
@@ -115,7 +117,7 @@ def _compute_metrics(
         sortino = 0.0
 
     equity = (1.0 + r).cumprod()
-    peak = equity.cummax()
+    peak = equity.cummax().clip(lower=1.0)
     drawdown = equity / peak - 1.0
     maximum_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
     years = len(r) / WEEKS_PER_YEAR
@@ -288,29 +290,46 @@ def _cap_l1_turnover(
     current_w: pd.Series,
     target_w: pd.Series,
     max_l1: float | None,
+    priority_assets: pd.Index | None = None,
+    materiality_threshold: float = 5e-4,
 ) -> pd.Series:
-    """Optionally cap a rebalance by interpolating toward its target."""
+    """Fund exit sales first, pairing every sale with an equal-sized purchase.
 
-    if max_l1 is None:
-        return target_w
-
-    max_l1 = float(max_l1)
-    if max_l1 <= 0:
-        return current_w.copy()
-
+    A fully invested long-only portfolio spends half its L1 budget on sales
+    and half on purchases. Independent scaling followed by renormalization
+    would undo exits and can breach the cap. No holdings are written off.
+    Initial funding is outside the strategy's turnover budget.
+    """
+    if max_l1 is not None and (not np.isfinite(max_l1) or max_l1 < 0):
+        raise ValueError("max_l1 must be finite and non-negative.")
+    if max_l1 is None or current_w.sum() <= _EPS:
+        return target_w.copy()
     delta = target_w - current_w
-    l1 = float(delta.abs().sum())
-
-    if l1 <= max_l1 + _EPS:
-        return target_w
-
-    scaled = current_w + delta * (max_l1 / l1)
-    scaled = scaled.clip(lower=0.0)
-
-    if scaled.sum() > _EPS:
-        scaled /= scaled.sum()
-
-    return scaled
+    if float(delta.abs().sum()) <= max_l1 + _EPS:
+        return target_w.copy()
+    sells = (-delta).clip(lower=0.0)
+    buys = delta.clip(lower=0.0)
+    budget = min(float(max_l1) / 2.0, float(sells.sum()), float(buys.sum()))
+    executed = pd.Series(0.0, index=delta.index)
+    priority = pd.Index([]) if priority_assets is None else pd.Index(priority_assets)
+    priority = priority.intersection(sells.index[sells > _EPS])
+    # Clear sellable dust first; then largest exits. Each completed sale
+    # removes a name rather than shrinking every exit geometrically.
+    dust = priority[current_w.reindex(priority).le(materiality_threshold)]
+    order = dust.append(sells.reindex(priority.difference(dust)).sort_values(
+        ascending=False, kind="stable"
+    ).index)
+    remaining = budget
+    for asset in order:
+        take = min(float(sells[asset]), remaining)
+        executed[asset] = -take
+        remaining -= take
+    ordinary = sells.drop(index=priority)
+    if remaining > _EPS and ordinary.sum() > _EPS:
+        executed.loc[ordinary.index] = -ordinary * (remaining / ordinary.sum())
+    if buys.sum() > _EPS:
+        executed += buys * (budget / buys.sum())
+    return current_w + executed
 
 
 def _portfolio_bounds_feasible(
@@ -457,6 +476,7 @@ def run_walk_forward(
     *,
     progress_every_rebalances: int = 0,
     progress_label: str | None = None,
+    year_end_callback: Callable[[int, BacktestResult], None] | None = None,
 ) -> BacktestResult:
     """
     Run a chronological walk-forward backtest.
@@ -510,6 +530,7 @@ def run_walk_forward(
     current_w = pd.Series(0.0, index=assets, dtype=float)
     last_rebalance_i: int | None = None
     rebalance_count = 0
+    diagnostic_rows = []
     run_started = time.perf_counter()
     total_backtest_steps = max(len(returns) - min_obs, 1)
     label = progress_label or allocator.__class__.__name__
@@ -521,7 +542,27 @@ def run_walk_forward(
         )
 
     # i is the return period being earned. The estimation window ends at i-1.
+    def emit_year(end: int) -> None:
+        if year_end_callback is None:
+            return
+        year = returns.index[end].year
+        mask = (returns.index[:end + 1].year == year)
+        annual_returns = port_ret.iloc[:end + 1].loc[mask].copy()
+        if annual_returns.notna().any():
+            annual_turnover = turnover.iloc[:end + 1].loc[mask].copy()
+            year_end_callback(year, BacktestResult(
+                weights=weights.iloc[:end + 1].loc[mask].copy(),
+                portfolio_returns=annual_returns,
+                turnover=annual_turnover,
+                metrics=_compute_metrics(annual_returns, annual_turnover,
+                                         risk_free_rate=risk_free_rate),
+                transaction_costs=transaction_costs.iloc[:end + 1].loc[mask].copy(),
+                ending_weights=current_w.copy(),
+            ))
+
     for i in range(1, len(returns)):
+        if year_end_callback is not None and returns.index[i].year != returns.index[i - 1].year:
+            emit_year(i - 1)
         start = max(0, i - lookback)
         window = returns.iloc[start:i].copy()
 
@@ -574,7 +615,11 @@ def run_walk_forward(
                 # Cost-aware allocators need drifted live holdings rather than
                 # merely their previous target when pricing the next trade.
                 holdings_setter(current_w.copy())
+            allocation_started = time.perf_counter()
             raw_target = allocator.allocate(eligible_window)
+            allocation_seconds = time.perf_counter() - allocation_started
+            exits = pd.Index(getattr(allocator, "last_exit_assets",
+                                     getattr(allocator, "_forced_exit_assets", [])))
             rebalance_count += 1
             if (
                 progress_every_rebalances > 0
@@ -610,6 +655,7 @@ def run_walk_forward(
                 current_w.sum() > _EPS
                 and drift_threshold > 0
                 and proposed_l1 < drift_threshold
+                and not len(exits)
             ):
                 target_w = current_w.copy()
                 proposed_l1 = 0.0
@@ -618,6 +664,8 @@ def run_walk_forward(
                 current_w,
                 target_w,
                 max_rebalance_turnover_l1,
+                priority_assets=exits,
+                materiality_threshold=max(float(getattr(allocator_config, "min_weight", 0.0)), 5e-4),
             )
 
             actual_l1 = float((target_w - current_w).abs().sum())
@@ -640,6 +688,21 @@ def run_walk_forward(
             if float((target_w - current_w).abs().sum()) > _EPS:
                 last_rebalance_i = i
 
+            diagnostic = getattr(allocator, "last_diagnostics", None)
+            details = diagnostic.as_dict() if hasattr(diagnostic, "as_dict") else {}
+            diagnostic_rows.append({
+                **details,
+                "date": returns.index[i], "formation_date": window.index[-1],
+                "eligible_asset_count": n_eligible,
+                "allocation_seconds": allocation_seconds,
+                "exit_asset_count": len(exits),
+                "exit_weight_before": float(current_w.reindex(exits).fillna(0).sum()),
+                "exit_weight_after": float(target_w.reindex(exits).fillna(0).sum()),
+                "executed_turnover_l1": actual_l1,
+                "transaction_cost": float(transaction_costs.iloc[i]),
+                "ml_consensus_fraction": getattr(allocator, "last_ml_consensus_fraction", np.nan),
+                "ml_training_cross_sections": getattr(allocator, "_ml_training_cross_sections", np.nan),
+            })
             current_w = target_w
             turnover.iloc[i] = actual_l1
 
@@ -668,6 +731,8 @@ def run_walk_forward(
             else:
                 current_w = pd.Series(0.0, index=assets, dtype=float)
 
+    emit_year(len(returns) - 1)
+
     if progress_every_rebalances > 0:
         elapsed_seconds = time.perf_counter() - run_started
         print(
@@ -689,6 +754,7 @@ def run_walk_forward(
         metrics=metrics,
         transaction_costs=transaction_costs,
         ending_weights=current_w.copy(),
+        diagnostics=pd.DataFrame(diagnostic_rows),
     )
 
 
@@ -891,14 +957,19 @@ def run_cpcv_backtest(
         split_items = list(enumerate(splits))
 
     results: dict[Any, BacktestResult] = {}
-    refit_per_split = bool(getattr(cfg, "cpcv_refit_per_split", False))
+    probe = allocator_factory(returns.iloc[0:0])
+    online = bool(getattr(probe, "requires_split_training", False))
+    requested_refit = getattr(cfg, "cpcv_refit_per_split", None)
+    if online and requested_refit is False:
+        raise ValueError("Online learners require cpcv_refit_per_split=True (or auto/None).")
+    refit_per_split = online if requested_refit is None else bool(requested_refit)
     shared_result: BacktestResult | None = None
 
     if not refit_per_split:
         # HRP has no globally fitted parameters: every estimate is formed from
         # the chronological prefix at the rebalance date. Reuse that one
         # expensive path and score it under every CPCV test selector.
-        shared_allocator = allocator_factory(returns.iloc[0:0])
+        shared_allocator = probe
         shared_result = run_walk_forward(returns, shared_allocator, cfg)
 
     for split_name, split in split_items:
@@ -914,7 +985,12 @@ def run_cpcv_backtest(
             train_ret = _selector_to_frame(returns, train_selector)
 
         if shared_result is None:
-            allocator = allocator_factory(train_ret)
+            if online:
+                # Never hand future train rows to a causal online factory.
+                allocator = allocator_factory(returns.iloc[0:0])
+                allocator.set_training_dates(train_ret.index)
+            else:
+                allocator = allocator_factory(train_ret)
             full_result = run_walk_forward(returns, allocator, cfg)
         else:
             full_result = shared_result
@@ -936,6 +1012,9 @@ def run_cpcv_backtest(
                 risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
             ),
             transaction_costs=test_transaction_costs,
+            validation_mode=("split_restricted_online_walk_forward" if online else
+                             "per_split_factory_walk_forward" if refit_per_split else
+                             "shared_walk_forward_resampling"),
         )
 
     return results

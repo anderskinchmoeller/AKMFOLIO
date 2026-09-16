@@ -41,6 +41,19 @@ class DynamicBarraAlphaConfig:
     minimum_price: float = 5.0
     minimum_dollar_volume: float = 1_000_000.0
     max_added_per_sector: int = 8
+    # No lower bound by design: the engine's generic feasibility check
+    # (_portfolio_bounds_feasible in backtest/engine.py) falls back to the
+    # shared HRPConfig.min_weight (0.01) for any allocator config that has
+    # no min_weight field of its own. For this model's actual eligible
+    # universe (hundreds to ~2500 PIT-eligible names), 0.01 * n is always
+    # >> 1, so every single week is silently declared infeasible -- zero
+    # rebalances during walk-forward, then a hard RuntimeError from
+    # latest_target_weights. RetailAlphaMPCConfig (this class's own
+    # subclass) already sets min_weight=0.0 explicitly; this backports the
+    # same fix to the base class so dynamic_barra_alpha works in the same
+    # broad-universe CLI runs as its retail_alpha_mpc/retail_alpha_ml_mpc
+    # descendants.
+    min_weight: float = 0.0
     max_weight: float = 0.03
     max_sector_weight: float = 0.25
     max_absolute_style_exposure: float = 0.25
@@ -116,6 +129,8 @@ def _asset_ids(values: pd.Index | pd.Series) -> pd.Index:
 
 def _robust_zscore(values: pd.Series) -> pd.Series:
     values = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if not values.notna().any():
+        return pd.Series(0.0, index=values.index)
     median = float(values.median())
     mad = 1.4826 * float((values - median).abs().median())
     if not np.isfinite(mad) or mad <= _EPS:
@@ -232,9 +247,17 @@ class _SectorStore:
             raise ValueError(f"Sector history is missing columns: {sorted(missing)}")
         frame["asset"] = _asset_ids(frame["permno"])
         frame["start"] = pd.to_datetime(frame["sec_info_start"], errors="raise")
-        frame["end"] = pd.to_datetime(frame["sec_info_end"], errors="coerce").fillna(
-            pd.Timestamp.max.normalize()
-        )
+        frame["end"] = pd.to_datetime(frame["sec_info_end"], errors="coerce")
+        # The latest `sec_info_end` in the file is the extract's censoring date
+        # (the WRDS pull stops there), not a real end of the security's
+        # record. Treat it as open-ended so the last known sector carries
+        # forward past the pull, the same as-of behaviour the PIT and feature
+        # stores already have. Without this every name is UNKNOWN after the
+        # censor date and the per-sector caps collapse the book.
+        censor = frame["end"].max()
+        if pd.notna(censor):
+            frame.loc[frame["end"].eq(censor), "end"] = pd.NaT
+        frame["end"] = frame["end"].fillna(pd.Timestamp.max.normalize())
         labels = frame["sector"].astype("string").str.strip()
         unusable = labels.str.upper().isin({"", "NOAVAIL", "N/A", "NA"})
         if "sic_code" in frame:

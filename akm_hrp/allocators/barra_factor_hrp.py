@@ -35,6 +35,17 @@ class BarraFactorHRPConfig:
     # Prevent the factor model from explaining away nearly all single-name
     # risk, a common source of unstable extreme weights.
     specific_variance_floor_fraction: float = 0.05
+    # No per-asset floor: this allocator (unlike the concentrated-book
+    # allocators HRPConfig.min_weight=0.01 was tuned for) is designed to run
+    # over whatever universe it's given, from the ~34-49 name balanced core
+    # up to the full broad top-2500 book. Leaving this unset let it silently
+    # inherit HRPConfig's 0.01 floor via engine.py's _portfolio_bounds_feasible,
+    # which made every rebalance "infeasible" (min_weight * n_eligible > 1)
+    # for any universe above ~100 names -- run_walk_forward silently skipped
+    # every rebalance (0 completed) and latest_target_weights hard-crashed
+    # with "Latest target bounds are infeasible". Matches RAHRPConfig's
+    # min_weight=0.0 for the same reason.
+    min_weight: float = 0.0
     # Calibrated for the balanced CRSP universe (roughly 49 names currently):
     # 3% remains feasible with >=34 names and yields about 41 effective names.
     max_weight: float = 0.03

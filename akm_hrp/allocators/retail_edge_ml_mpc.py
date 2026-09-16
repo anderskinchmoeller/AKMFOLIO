@@ -143,7 +143,9 @@ class RetailEdgeMLMPCAllocator(RetailEdgeMPCAllocator):
             (source.index > self._previous_ml_date)
             & (source.index <= current_date)
         ]
-        if forward_rows.empty:
+        if forward_rows.empty or not self._learning_interval_allowed(
+            self._previous_ml_date, forward_rows.index
+        ):
             return
         forward = (1.0 + forward_rows).prod(min_count=1) - 1.0
         common = self._previous_ml_design.index.intersection(forward.dropna().index)

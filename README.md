@@ -706,6 +706,38 @@ Merger, CEF, warrant, and option sleeves activate only when real point-in-time
 event fields are supplied. See [HRP Alpha v2](docs/hrp-alpha-v2.md).
 
 The dashboard is calculated from the same walk-forward results as the metrics.
+In addition to the requested full-period files, export writes a file for each
+calendar year present in the focus model after `--evaluation-start` filtering,
+including partial years. For example, `dashboard.pdf` also produces
+`dashboard_2024.pdf`, `dashboard_2025.pdf`, etc.; PNG follows the same convention.
+For dashboards during a run, add `--dashboard-every-year`. Each completed
+calendar year is exported immediately, and the final partial year is exported
+at the end. Run comparison models before the focus model to include them in
+these live exports. The full weekly retail-alpha run is:
+
+```bash
+bash /Users/anderskinch/AKMFOLIO/run_full_scale_retail_alpha_ml_mpc.sh
+```
+
+The launcher uses the installed Portfolio Python environment, evaluates from
+1996-01-05, and saves a timestamped run directory with live terminal output,
+`run.log`, annual PDF/PNG dashboards, and final full-period results.
+
+Both full-scale retail-alpha launchers enable
+`--retail-alpha-ml-allow-exposure-limit-relaxation`. If the sector/style caps
+jointly exclude a fully invested portfolio, the allocator finds the minimum
+common additive increase across those caps and all planning steps. For example,
+an increase of 0.01 changes a 25% sector cap to 26% and a 0.25 absolute style
+limit to 0.26. Each event is logged with the formation date and recorded as
+`exposure_limit_relaxation` in diagnostics; the increase resets on each rebalance.
+Full investment, per-name bounds, trading capacity, and forced exits remain hard
+constraints. CVaR follows its separate existing relaxation flag. Direct CLI and
+Python usage remain strict unless exposure relaxation is explicitly enabled.
+This changes the portfolio policy, so retain the relaxation diagnostics alongside
+backtest results. It does not restore state from a failed run.
+
+Annual panels contain only that year's observations, so a multi-year rolling
+Sharpe window has no values in an annual dashboard.
 It compares every model named by `--models` in the equity, drawdown, and rolling
 Sharpe panels; transaction costs and the ticker-labelled weight heatmap use
 `--dashboard-focus-model`. For a benchmark comparison, run `--models

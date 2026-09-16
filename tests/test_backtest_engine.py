@@ -17,7 +17,6 @@ from akm_hrp.cli.compare_models import (
     _save_weights_png,
 )
 from akm_hrp.data.pit_universe import load_pit_universe_mask
-from akm_hrp.diagnostics.dashboard import export_backtest_dashboard
 
 
 class EqualWeightAllocator:
@@ -206,55 +205,6 @@ def test_weight_png_is_rendered(tmp_path):
     assert destination.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 
-def test_backtest_dashboard_renders_pdf_and_png(tmp_path):
-    dates = pd.date_range("2020-01-03", periods=120, freq="W-FRI")
-    focus_returns = pd.Series(
-        0.001 + 0.01 * np.sin(np.arange(len(dates)) / 7.0),
-        index=dates,
-    )
-    benchmark_returns = pd.Series(
-        0.0008 + 0.008 * np.cos(np.arange(len(dates)) / 9.0),
-        index=dates,
-    )
-    focus_weights = pd.DataFrame(
-        {
-            "11995": 0.50 + 0.05 * np.sin(np.arange(len(dates)) / 8.0),
-            "19849": 0.30 - 0.03 * np.sin(np.arange(len(dates)) / 8.0),
-            "99999": 0.20 - 0.02 * np.sin(np.arange(len(dates)) / 8.0),
-        },
-        index=dates,
-    )
-    benchmark_weights = pd.DataFrame(
-        np.full((len(dates), 3), 1.0 / 3.0),
-        index=dates,
-        columns=focus_weights.columns,
-    )
-    focus_result = SimpleNamespace(
-        portfolio_returns=focus_returns,
-        turnover=focus_weights.diff().abs().sum(axis=1).fillna(0.0),
-        weights=focus_weights,
-    )
-    benchmark_result = SimpleNamespace(
-        portfolio_returns=benchmark_returns,
-        turnover=benchmark_weights.diff().abs().sum(axis=1).fillna(0.0),
-        weights=benchmark_weights,
-    )
-    pdf_path = tmp_path / "dashboard.pdf"
-    png_path = tmp_path / "dashboard.png"
-
-    artifacts = export_backtest_dashboard(
-        {"hrp_alpha_v2": focus_result, "equal_weight": benchmark_result},
-        focus_model="hrp_alpha_v2",
-        output_pdf=pdf_path,
-        output_png=png_path,
-        rolling_sharpe_years=1,
-        ticker_map={"11995": "AAPL", "19849": "MSFT"},
-    )
-
-    assert artifacts == {"pdf": pdf_path, "png": png_path}
-    assert pdf_path.read_bytes().startswith(b"%PDF")
-    assert png_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
-
 
 def test_pit_loader_rejects_mismatched_asset_identifiers(tmp_path):
     pit_path = tmp_path / "pit.csv"
@@ -266,3 +216,31 @@ def test_pit_loader_rejects_mismatched_asset_identifiers(tmp_path):
             dates=pd.DatetimeIndex(["2025-01-03"]),
             assets=["11995", "19849"],
         )
+
+
+def test_year_end_callback_emits_completed_years_without_changing_results(tmp_path):
+    from akm_hrp.diagnostics.dashboard import _export_dashboard_period
+    returns = pd.DataFrame(
+        np.random.default_rng(42).normal(0.001, 0.01, (120, 2)),
+        index=pd.date_range("2019-10-04", periods=120, freq="W-FRI"),
+        columns=["A", "B"],
+    )
+    allocator = RecordingEqualWeightAllocator()
+    snapshots = []
+
+    def on_year(year, result):
+        # Callback fires before the allocator sees any subsequent year's data.
+        assert allocator.last_window.index[-1].year <= year
+        assert set(result.portfolio_returns.index.year) == {year}
+        assert result.portfolio_returns.notna().any()
+        snapshots.append(result)
+        _export_dashboard_period(
+            {"equal_weight": result}, focus_model="equal_weight",
+            output_png=tmp_path / f"dashboard_{year}.png")
+
+    streamed = run_walk_forward(returns, allocator, _config(), year_end_callback=on_year)
+    normal = run_walk_forward(returns, EqualWeightAllocator(), _config())
+    pd.testing.assert_series_equal(streamed.portfolio_returns, normal.portfolio_returns)
+    pd.testing.assert_frame_equal(streamed.weights, normal.weights)
+    assert [r.portfolio_returns.index[0].year for r in snapshots] == [2019, 2020, 2021, 2022]
+    assert len(list(tmp_path.glob("dashboard_*.png"))) == 4

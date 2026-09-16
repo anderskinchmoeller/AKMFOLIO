@@ -12,10 +12,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parent / "stubs"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from retail_alpha_ml_mpc import (  # noqa: E402
+from akm_hrp.allocators.retail_alpha_ml_mpc import (  # noqa: E402
     _bias_adjusted_squared_sharpe,
     _growth_optimal_factor_allocation,
     _growth_optimal_kelly_fraction,
@@ -184,13 +183,20 @@ def test_maximum_fraction_caps():
 
 def test_allocator_buffer_end_to_end():
     """The buffer must fill causally through the real allocator plumbing."""
-    from retail_alpha_ml_mpc import RetailAlphaMLMPCAllocator, RetailAlphaMLMPCConfig
+    from akm_hrp.allocators.retail_alpha_ml_mpc import RetailAlphaMLMPCAllocator, RetailAlphaMLMPCConfig
 
     allocator = RetailAlphaMLMPCAllocator.__new__(RetailAlphaMLMPCAllocator)
     allocator.config = RetailAlphaMLMPCConfig(
         ml_kelly_mix_enabled=True, ml_kelly_scale_enabled=True
     )
     allocator._engine_return_context = None
+    # These tests bypass __init__/reset_state() via __new__ and only wire up
+    # the ML-ensemble state _initialize_ml_state() owns; _training_dates is
+    # base-class (RetailAlphaMPCAllocator) state that _accumulate_factor_returns
+    # -> _learning_interval_allowed still reads, and only reset_state()/set_
+    # training_dates() would normally set it. None means "no split restriction",
+    # matching a freshly constructed allocator.
+    allocator._training_dates = None
     allocator._initialize_ml_state()
 
     assets = pd.Index([f"A{i:03d}" for i in range(40)])
@@ -225,7 +231,7 @@ def test_allocator_buffer_end_to_end():
 
 def test_kns_ridge_estimator():
     """The shipped default: ridge shrinkage in the direction, not a haircut."""
-    from retail_alpha_ml_mpc import _kns_ridge_factor_weights
+    from akm_hrp.allocators.retail_alpha_ml_mpc import _kns_ridge_factor_weights
 
     # With real signal the ridge should take a meaningful position...
     g, _ = _simulate_factor_returns(9, 260, 1.0)
@@ -251,7 +257,7 @@ def test_kns_ridge_estimator():
 
 
 def _retired_ridge_mode_check():
-    from retail_alpha_ml_mpc import _growth_optimal_factor_allocation
+    from akm_hrp.allocators.retail_alpha_ml_mpc import _growth_optimal_factor_allocation
 
     g, _ = _simulate_factor_returns(9, 260, 1.0)
     mix, frac, diag = _growth_optimal_factor_allocation(
@@ -271,7 +277,7 @@ def test_effective_breadth_and_the_redundancy_tax():
     this book's nominal breadth overstates its effective breadth, which makes
     pruning the cheapest available increase in the defensible risk budget.
     """
-    from retail_alpha_ml_mpc import effective_breadth
+    from akm_hrp.allocators.retail_alpha_ml_mpc import effective_breadth
 
     T = 260
     base = RNG.normal(0.0, 0.01, size=(T, 5))
@@ -302,7 +308,7 @@ def test_ridge_returns_a_bounded_fraction():
     notional (~8.0) where the caller expects a fraction, which would have
     multiplied the alpha vector eightfold inside the optimizer.
     """
-    from retail_alpha_ml_mpc import _growth_optimal_factor_allocation
+    from akm_hrp.allocators.retail_alpha_ml_mpc import _growth_optimal_factor_allocation
 
     for sr in (0.0, 0.5, 2.0):
         g, _ = _simulate_factor_returns(9, 260, sr)
@@ -322,7 +328,7 @@ def test_crowding_kappa_disabled_by_default_is_a_no_op():
     existed -- matching the "nothing changes until deliberately enabled"
     convention already used for `ml_kelly_mix_enabled` / `_scale_enabled`.
     """
-    from retail_alpha_ml_mpc import _growth_optimal_factor_allocation
+    from akm_hrp.allocators.retail_alpha_ml_mpc import _growth_optimal_factor_allocation
 
     g, _ = _simulate_factor_returns(9, 260, 1.0)
     mix_a, frac_a, diag_a = _growth_optimal_factor_allocation(
@@ -339,7 +345,7 @@ def test_crowding_kappa_disabled_by_default_is_a_no_op():
 def test_crowding_kappa_burn_in_gate():
     """Inactive below 39 weeks (13-week window + 26-week baseline), active at
     exactly 39 -- the boundary fixed in the pre-registration."""
-    from retail_alpha_ml_mpc import _crowding_regime_kappa
+    from akm_hrp.allocators.retail_alpha_ml_mpc import _crowding_regime_kappa
 
     beta = float(np.log(2.0) / 2.0)
     below = RNG.normal(0.0, 0.02, size=(38, 9))
@@ -357,7 +363,7 @@ def test_crowding_kappa_is_direction_agnostic():
     correlation FALLING during the unwind, not spiking -- so this must shrink
     kappa on an abnormal fall just as it does on an abnormal rise (Sec 2 of
     crowding_kappa_preregistration.md)."""
-    from retail_alpha_ml_mpc import _crowding_regime_kappa
+    from akm_hrp.allocators.retail_alpha_ml_mpc import _crowding_regime_kappa
 
     beta = float(np.log(2.0) / 2.0)
     rng = np.random.default_rng(11)
@@ -403,7 +409,7 @@ def test_crowding_kappa_wired_into_ridge_reduces_gross():
     crowding adjustment on a spiked window must shrink kappa (and therefore
     not exceed the unadjusted gross position) relative to leaving it off, on
     the identical data."""
-    from retail_alpha_ml_mpc import _growth_optimal_factor_allocation
+    from akm_hrp.allocators.retail_alpha_ml_mpc import _growth_optimal_factor_allocation
 
     rng = np.random.default_rng(23)
     base = rng.normal(0.0, 0.01, size=(199, 9))
@@ -430,7 +436,7 @@ def test_crowding_kappa_end_to_end_through_allocator():
     """The config flag must reach the real allocator's own diagnostics dict
     through the same causal buffer plumbing `test_allocator_buffer_end_to_end`
     exercises for the base ridge."""
-    from retail_alpha_ml_mpc import RetailAlphaMLMPCAllocator, RetailAlphaMLMPCConfig
+    from akm_hrp.allocators.retail_alpha_ml_mpc import RetailAlphaMLMPCAllocator, RetailAlphaMLMPCConfig
 
     allocator = RetailAlphaMLMPCAllocator.__new__(RetailAlphaMLMPCAllocator)
     allocator.config = RetailAlphaMLMPCConfig(
@@ -438,6 +444,13 @@ def test_crowding_kappa_end_to_end_through_allocator():
         ml_kelly_crowding_kappa_enabled=True,
     )
     allocator._engine_return_context = None
+    # These tests bypass __init__/reset_state() via __new__ and only wire up
+    # the ML-ensemble state _initialize_ml_state() owns; _training_dates is
+    # base-class (RetailAlphaMPCAllocator) state that _accumulate_factor_returns
+    # -> _learning_interval_allowed still reads, and only reset_state()/set_
+    # training_dates() would normally set it. None means "no split restriction",
+    # matching a freshly constructed allocator.
+    allocator._training_dates = None
     allocator._initialize_ml_state()
 
     assets = pd.Index([f"A{i:03d}" for i in range(40)])

@@ -11,3 +11,10 @@ venv/
 nohup.out
 /data/
 /outputs/
+
+# Run artifacts and staged data — large, regenerable, not source
+/runs/
+/data_backup/
+/universe/
+/wrds_balanced_hrp/
+/wrds_top2500/

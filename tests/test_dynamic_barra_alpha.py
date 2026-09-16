@@ -7,6 +7,7 @@ from akm_hrp.allocators.dynamic_barra_alpha import (
     DynamicBarraAlphaConfig,
     _FeatureStore,
 )
+from akm_hrp.backtest.engine import _portfolio_bounds_feasible
 
 
 def test_dynamic_model_keeps_balanced_core_and_adds_candidates() -> None:
@@ -90,3 +91,29 @@ def test_feature_store_carries_each_pit_field_from_its_own_release() -> None:
 
     assert snapshot.loc["10001", "book_to_market"] == pytest.approx(0.7)
     assert snapshot.loc["10001", "market_cap_usd"] == pytest.approx(2e9)
+
+
+
+def test_default_config_stays_feasible_for_a_broad_top2500_universe() -> None:
+    """Regression: DynamicBarraAlphaConfig had no min_weight field of its own,
+    so the engine's generic feasibility check (_portfolio_bounds_feasible)
+    fell back to the shared HRPConfig default (min_weight=0.01). At the
+    hundreds-to-2500-name scale this allocator actually runs at in a broad
+    top-2500 CLI comparison, 0.01 * n_assets is always >> 1, so every week
+    was silently declared infeasible -- zero rebalances during walk-forward,
+    then a hard RuntimeError from latest_target_weights. Confirms the fix
+    (min_weight=0.0 on DynamicBarraAlphaConfig, matching what its own
+    subclass RetailAlphaMPCConfig already had) keeps this feasible."""
+    balanced_pit = pd.DataFrame(
+        True, index=pd.date_range("2022-01-07", periods=5, freq="W-FRI"),
+        columns=["A", "B"],
+    )
+    allocator = DynamicBarraAlphaAllocator(balanced_pit)
+
+    class _FallbackOnlyConfig:
+        """Stand-in for a shared HRPConfig with the old min_weight=0.01 default."""
+        min_weight = 0.01
+        max_weight = 1.0
+
+    for n_assets in (200, 2381, 2500):
+        assert _portfolio_bounds_feasible(allocator, _FallbackOnlyConfig(), n_assets)
