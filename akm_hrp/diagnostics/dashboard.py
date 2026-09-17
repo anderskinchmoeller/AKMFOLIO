@@ -14,6 +14,7 @@ _EPS = 1e-12
 
 _MODEL_LABELS = {
     "equal_weight": "Equal Weight",
+    "URTH": "URTH (MSCI World ETF)",
     "inverse_volatility": "Inverse Volatility",
     "regularized_minimum_variance": "Regularized Minimum Variance",
     "ra_hrp": "RA-HRP",
@@ -79,8 +80,14 @@ def _after(series: pd.Series | pd.DataFrame, start: pd.Timestamp | None):
 
 
 def _equity_curve(returns: pd.Series) -> pd.Series:
-    clean = returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return (1.0 + clean).cumprod()
+    clean = returns.replace([np.inf, -np.inf], np.nan)
+    first = clean.first_valid_index()
+    equity = (1.0 + clean.fillna(0.0)).cumprod()
+    # A series that starts later (e.g. an ETF benchmark launched mid-sample)
+    # is drawn from its first return, not as a flat line before it existed.
+    if first is not None:
+        equity.loc[equity.index < first] = np.nan
+    return equity
 
 
 def _drawdown_pct(returns: pd.Series) -> pd.Series:

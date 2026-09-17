@@ -5,6 +5,12 @@ Explicit execution-cost modeling (spread + temporary + permanent impact) baked i
 Regime-adaptive clustering (ra_hrp_v2_allocator.py's stability-spike gating) — this is a genuinely sophisticated idea most public HRP implementations don't have
 
 
+1. Alle modeller er priset ind i market (MVO, MVP, HRP, CAPM, ..... )
+2. Ingen faktor signaler generer alpha (ikke nok til at dœkke omkostninger)
+3. Hvis du får gode resultater er det pga. overfitting og støj fra estimater.
+
+Hvis modellen ska holde, skal man efter at have skrevet den for første gang (på data man ikke kender) kunne se at forskellen mellem ens benchmark og modellen er signifikant ifht. HAC t statistikkens ensidet test. Man vil afvise nulhypotesen som siger at modellen ikke afviger fra benchmarket signifikant.  
+
  
 
 # AKM HRP
@@ -894,3 +900,38 @@ This is research software. The documentation distinguishes between:
 3. **known limitations that should be reviewed before treating results as production-grade out-of-sample evidence**.
 
 See [Known limitations](docs/known-limitations.md).
+
+## HRP-orthogonal structural signals (retail_alpha_ml_mpc family)
+
+Three optional signals, ported from `hrp_model` (`akm_hrp/signals/structural_alpha.py`):
+
+| name | idea | inputs |
+|---|---|---|
+| `moc_dislocation_reversal` | close-vs-VWAP-proxy dislocation, weighted by abnormal volume and passive-rebalance calendar (S&P/Nasdaq quarterlies, Russell recon, MSCI reviews, month-end); bets on reversal, amplified in illiquid names | `data/microstructure_alpha_features.csv.gz` |
+| `microstructure_regime_ml` | gradient-boosted trees (LightGBM if installed, else sklearn HistGB) over order-flow toxicity (BVC imbalance, VPIN proxy, Kyle lambda), spreads, volume shocks, optional `sentiment_*`/`altdata_*` columns, each interacted with the HMM stress probability; trained on beta/cluster-neutral forward returns | same file + liquidity features |
+| `regime_conditional_momentum` | 12-1 momentum and 1-week reversal blended with per-regime ICs learned online, weighted by forward-filtered Gaussian-HMM state probabilities; momentum switched off in bear + stress; faded by a conviction factor | returns (+ `data/crsp_treasury_weekly_returns.csv` as macro input) |
+
+HRP design rule: every signal is rank-normalised, residualised on
+`[1, shrunk beta, HRP correlation-cluster dummies, industry (+ styles)]`, exactly
+de-meaned and scaled to unit variance (`akm_hrp/signals/hrp_orthogonal.py`).
+Clusters use the HRP distance `sqrt((1-rho)/2)` with average linkage on a
+Marchenko-Pastur-denoised correlation of the broad universe. The checks
+(`structural__*_cluster_r2_clean`, `structural__*_beta_corr_clean`) are written
+to `diagnostics.csv` every rebalance and should be ~0.
+
+```bash
+python -m akm_hrp.cli.compare_models ... --structural-signals all
+# or a subset: --structural-signals moc_dislocation_reversal regime_conditional_momentum
+```
+
+Rebuild the feature file (daily CRSP CIZ OHLC, resumable cache):
+
+```bash
+python -m akm_hrp.cli.build_microstructure_features --download --start 1989-01-01 --end 2026-08-31 \
+  --cache-dir wrds_data/daily_ohlc_cache
+python -m akm_hrp.cli.build_microstructure_features --cache-dir wrds_data/daily_ohlc_cache \
+  --universe data/weekly_returns.csv --output data/microstructure_alpha_features.csv.gz
+```
+
+The microstructure signals switch off (zero coverage, with a warning) after the
+last date in the feature file, so stale closing data is never carried forward.

@@ -141,7 +141,7 @@ import logging
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass, field as dataclass_field, replace
 
 import numpy as np
 import pandas as pd
@@ -179,6 +179,12 @@ from akm_hrp.cov.ensemble import covariance_to_correlation
 from akm_hrp.hrp.allocation import hrp_allocate, risk_contribution_regularize
 from akm_hrp.hrp.trees import quasi_diagonalize
 from akm_hrp.overlay.bounds import apply_bounds
+from akm_hrp.signals.structural_alpha import (
+    STRUCTURAL_IC_PRIORS,
+    STRUCTURAL_SIGNALS,
+    StructuralAlphaConfig,
+    StructuralAlphaEngine,
+)
 
 _BASE_SIGNALS = (
     "momentum_12_1",
@@ -509,6 +515,38 @@ class RetailAlphaMLMPCConfig(RetailAlphaMPCConfig):
     # and Kelly sizing are earning their keep, because it holds selection fixed.
     # Run both: the pair decomposes performance into selection and sizing.
     ml_equal_weight_benchmark: bool = False
+
+    # --- Which names the optimizer sizes ------------------------------------
+    # "signal": the book is the top `ml_max_total_assets` names of the joint
+    #           core + admitted-candidate ranking on the composite signal score
+    #           (the default; selection is driven by the signals).
+    # "core":   the book is the whole sector-balanced, size/liquidity-screened
+    #           balanced PIT core (~170 names, chosen without any alpha
+    #           signal). No admissions, no score-ranked trim, no min-weight
+    #           floor (it would re-select by optimizer weight). The signals
+    #           still enter the optimizer's alpha, so they only *size* names.
+    #           Motivated by retail_alpha_ml_mpc_final_result.md: selection
+    #           cost -0.031 Sharpe, sizing added +0.133.
+    ml_selection_mode: str = "signal"
+
+    # --- HRP-orthogonal structural signals (off by default) ----------------
+    # Subset of akm_hrp.signals.structural_alpha.STRUCTURAL_SIGNALS:
+    #   "moc_dislocation_reversal"     closing-auction / passive-flow reversal
+    #   "microstructure_regime_ml"     boosted-tree order-flow x regime model
+    #   "regime_conditional_momentum"  HMM-state-conditional momentum/reversal
+    #   "betting_against_beta"         Frazzini-Pedersen low-beta tilt (beta is the
+    #                                  signal, so it is cluster/industry-neutral only)
+    # Each is rank-normalised, stripped of shrunk market beta, of the HRP
+    # correlation-cluster dummies and of industry (plus styles for the first
+    # two), then exactly de-meaned and scaled to unit variance before it
+    # enters the panel -- so it cannot simply re-weight a cluster the HRP
+    # prior has already sized. It then earns its weight through the same
+    # online IC machinery as every other signal. With the tuple empty the
+    # allocator is identical to the version without them.
+    structural_signals: tuple[str, ...] = ()
+    structural_alpha: StructuralAlphaConfig = dataclass_field(
+        default_factory=StructuralAlphaConfig
+    )
 
 
 def _tilt_signal_panel(
@@ -1732,13 +1770,50 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
         _ML_SIGNAL: 0.0,
     }
 
-    def __init__(self, balanced_pit: pd.DataFrame, **kwargs) -> None:
+    def __init__(
+        self,
+        balanced_pit: pd.DataFrame,
+        *,
+        macro_features: pd.DataFrame | None = None,
+        **kwargs,
+    ) -> None:
         if kwargs.get("config") is None:
             kwargs["config"] = RetailAlphaMLMPCConfig()
-        super().__init__(balanced_pit, **kwargs)
-        if not isinstance(self.config, RetailAlphaMLMPCConfig):
+        config = kwargs["config"]
+        if not isinstance(config, RetailAlphaMLMPCConfig):
             raise TypeError(
                 "RetailAlphaMLMPCAllocator requires RetailAlphaMLMPCConfig."
+            )
+        if config.ml_selection_mode not in ("signal", "core"):
+            raise ValueError(
+                f"ml_selection_mode must be 'signal' or 'core'; got "
+                f"{config.ml_selection_mode!r}."
+            )
+        unknown = set(config.structural_signals) - set(STRUCTURAL_SIGNALS)
+        if unknown:
+            raise ValueError(
+                f"Unknown structural_signals {sorted(unknown)}; "
+                f"choose from {STRUCTURAL_SIGNALS}."
+            )
+        structural = tuple(
+            name for name in STRUCTURAL_SIGNALS if name in config.structural_signals
+        )
+        if structural:
+            # Instance-level, and set before the parent __init__ builds its IC
+            # state from self.signal_names; with none enabled the class-level
+            # names are used unchanged.
+            self.signal_names = (*type(self).signal_names, *structural)
+            self.ic_priors = {
+                **type(self).ic_priors,
+                **{name: STRUCTURAL_IC_PRIORS[name] for name in structural},
+            }
+        super().__init__(balanced_pit, **kwargs)
+        self._structural_engine: StructuralAlphaEngine | None = None
+        if structural:
+            self._structural_engine = StructuralAlphaEngine(
+                replace(config.structural_alpha, signals=structural),
+                feature_columns=list(getattr(self.features, "value_columns", []) or []),
+                macro=macro_features,
             )
         self._initialize_ml_state()
 
@@ -1783,10 +1858,13 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
         self.last_kelly_diagnostics: dict[str, float] = {}
         self.last_vsk_tilt_l1: float = 0.0
         self.last_pruned_dust_assets: pd.Index = pd.Index([])
+        self.last_structural_diagnostics: dict[str, float] = {}
 
     def reset_state(self) -> None:
         super().reset_state()
         self._initialize_ml_state()
+        if getattr(self, "_structural_engine", None) is not None:
+            self._structural_engine.reset()
 
     def set_tax_lot_info(
         self, tax_rate_per_name: pd.Series, unrealized_gain_frac: pd.Series
@@ -1834,6 +1912,15 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             if signal in self._reported_unusable_signals:
                 continue
             value = float(value)
+            if value <= _EPS and signal in (
+                "microstructure_regime_ml",
+                "regime_conditional_momentum",
+            ):
+                # Learned / conviction-gated structural signals are zero while
+                # their model warms up or their regime edge is weak; that is
+                # not missing data (compare_models warns separately when the
+                # microstructure file is absent), so don't report it as such.
+                continue
             if value <= _EPS:
                 self._reported_unusable_signals.add(signal)
                 logging.getLogger(__name__).warning(
@@ -2290,7 +2377,35 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
         self._previous_ml_design = design.copy()
         self._previous_ml_eligible = eligible.copy()
         self._previous_ml_date = current_date
-        return signals.reindex(columns=self.signal_names), coverage, masks
+
+        if self._structural_engine is not None:
+            # Forward returns for the engine's causal learners come from the
+            # same source the Kelly factor-return buffer uses.
+            forward_source = (
+                self._engine_return_context
+                if self._engine_return_context is not None
+                else observed_returns
+            )
+            extra, extra_coverage, extra_masks = self._structural_engine.build(
+                returns,
+                snapshot,
+                exposures,
+                market_caps.reindex(returns.columns),
+                observed_returns,
+                forward_source=forward_source,
+            )
+            for name in self._structural_engine.config.signals:
+                signals[name] = extra[name]
+                masks[name] = extra_masks[name]
+                coverage.loc[name] = extra_coverage[name]
+            self.last_structural_diagnostics = dict(
+                self._structural_engine.last_diagnostics
+            )
+        return (
+            signals.reindex(columns=self.signal_names),
+            coverage.reindex(self.signal_names).fillna(0.0),
+            masks.reindex(columns=self.signal_names).fillna(False),
+        )
 
     def _short_overlay_weights(
         self, returns: pd.DataFrame, long_weights: pd.Series
@@ -2629,6 +2744,11 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             kept.append(asset)
             kept_sector_counts[sector] = kept_sector_counts.get(sector, 0) + 1
         continuing = pd.Index(kept)
+        if self.config.ml_selection_mode == "core":
+            # Signal-free selection: hold the whole balanced core. Everything
+            # above still ran (IC learning and the ML buffers need it), but
+            # none of it decides membership.
+            continuing = core.difference(self._forced_exit_assets)
         held_assets = previously_held
         exiting = held_assets.difference(continuing)
         self.last_exit_assets = exiting.copy()
@@ -3527,7 +3647,9 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
         final = _apply_min_weight_floor(
             pre_floor,
             (
-                float(self.config.ml_min_weight)
+                0.0
+                if self.config.ml_selection_mode == "core"
+                else float(self.config.ml_min_weight)
                 if self.config.ml_min_weight is not None
                 else 1.0 / max(int(self.config.ml_max_total_assets), 1)
             ),
@@ -3654,6 +3776,11 @@ class RetailAlphaMLMPCAllocator(RetailAlphaMPCAllocator):
             signal_rank_ics=signal_ics.to_dict(),
             signal_ic_observations=self._ic_weight.to_dict(),
             signal_coverages=signal_coverage.to_dict(),
+            extra_diagnostics={
+                f"structural__{key}": value
+                for key, value in self.last_structural_diagnostics.items()
+                if key != "date"
+            },
         )
         self._engine_current_weights = None
         return final

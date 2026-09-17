@@ -63,7 +63,7 @@ if [[ -n "${DATA_START:-}" ]]; then
 fi
 
 echo "Run directory: $PWD/$OUT"
-echo "cadence: 13w, max-total-assets budget: $BUDGET, min weight: 1%, turnover cap: 2.0"
+echo "cadence: 13w, max-total-assets budget: $BUDGET, min weight: 1%, max weight: none (3% cap removed), turnover cap: 2.0, benchmarks: equal_weight + URTH"
 "$PYTHON" -u -m akm_hrp.cli.compare_models \
   --returns data/weekly_returns.csv \
   --models equal_weight retail_alpha_ml_mpc \
@@ -76,19 +76,21 @@ echo "cadence: 13w, max-total-assets budget: $BUDGET, min weight: 1%, turnover c
   --dynamic-portfolio-value 100000 \
   --retail-mpc-horizon 3 \
   --retail-max-added-assets 30 \
-  --retail-optimizer-max-iterations 450 \
+  --retail-optimizer-max-iterations 600 \
   --retail-alpha-ml-max-total-assets "$BUDGET" \
   --retail-alpha-ml-min-weight 0.01 \
+  --retail-alpha-ml-max-weight 1.0 \
   --retail-alpha-ml-max-training-cross-sections 252 \
   "${DATA_START_ARGS[@]}" \
   --evaluation-start 2005-01-05 \
   --significance-benchmark equal_weight \
+  --external-benchmarks URTH \
   --deflated-sharpe-trials 6 \
   --retail-alpha-ml-allow-exposure-limit-relaxation \
   --retail-alpha-ml-allow-cvar-floor-relaxation \
   --progress-every-rebalances 1 \
   --dynamic-sector-history data/sector_history.csv \
-  --dynamic-features data/structural_features.csv \
+  --dynamic-features data/structural_features.csv data/compustat_pit_features_long.csv.gz \
   --dynamic-balanced-pit data/balanced_hrp/pit_universe.csv \
   --dynamic-balanced-returns data/balanced_hrp/weekly_returns.csv \
   --asset-metadata data/crsp_security_metadata.csv \
@@ -100,7 +102,7 @@ echo "cadence: 13w, max-total-assets budget: $BUDGET, min weight: 1%, turnover c
   --dashboard-pdf "$OUT/dashboard.pdf" \
   --dashboard-png "$OUT/dashboard.png" \
   --dashboard-focus-model retail_alpha_ml_mpc \
-  --dashboard-title "13w, budget=$BUDGET, 1% floor, turnover cap 2.0: retail_alpha_ml_mpc vs Equal Weight" \
+  --dashboard-title "13w, budget=$BUDGET, 1% floor, no weight cap, turnover cap 2.0: retail_alpha_ml_mpc vs Equal Weight and URTH" \
   "$@" 2>&1 | tee "$OUT/run.log"
 
 echo "Done. Results in $OUT/"

@@ -78,6 +78,16 @@ _COLUMN_CANDIDATES = {
     "price": ("dlyprc", "prc"),
     "market_cap": ("dlycap", "marketcap", "mktcap"),
     "volume": ("dlyvol", "vol"),
+    # Daily bar and quote fields used by the microstructure / closing-auction
+    # features (akm_hrp.data.microstructure_features). Optional: resolved
+    # only when the CIZ table exposes them.
+    "open": ("dlyopen", "openprc"),
+    "high": ("dlyhigh", "askhi"),
+    "low": ("dlylow", "bidlo"),
+    "close": ("dlyclose",),
+    "bid": ("dlybid", "bid"),
+    "ask": ("dlyask", "ask"),
+    "num_trades": ("dlynumtrd", "numtrd"),
     "ticker": ("ticker", "tradingticker"),
     "company_name": ("issuername", "comnam"),
     "share_type": ("sharetype",),
@@ -596,7 +606,19 @@ def standardize_crsp_daily(daily: pd.DataFrame) -> pd.DataFrame:
     out = daily.copy()
     out["date"] = pd.to_datetime(out["date"], errors="raise")
     out["permno"] = pd.to_numeric(out["permno"], errors="raise").astype("int64")
-    for column in ("ret", "price", "market_cap", "volume"):
+    for column in (
+        "ret",
+        "price",
+        "market_cap",
+        "volume",
+        "open",
+        "high",
+        "low",
+        "close",
+        "bid",
+        "ask",
+        "num_trades",
+    ):
         if column in out.columns:
             out[column] = pd.to_numeric(out[column], errors="coerce")
     if "price" in out.columns:

@@ -12,7 +12,7 @@ This is a transparent research model, not a claim to reproduce a proprietary
 vendor risk model or an institutional execution system.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -119,6 +119,9 @@ class RetailAlphaMPCDiagnostics:
     signal_coverages: dict[str, float]
 
     exposure_limit_relaxation: float = 0.0
+    # Flat, model-specific extras (e.g. structural-signal orthogonality
+    # checks) written as their own diagnostics columns.
+    extra_diagnostics: dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, float | int | str | bool]:
         result: dict[str, float | int | str | bool] = {
@@ -130,8 +133,10 @@ class RetailAlphaMPCDiagnostics:
                 "signal_rank_ics",
                 "signal_ic_observations",
                 "signal_coverages",
+                "extra_diagnostics",
             }
         }
+        result.update(self.extra_diagnostics)
         signal_names = tuple(self.signal_weights)
         for signal in signal_names:
             result[f"signal_weight__{signal}"] = self.signal_weights[signal]

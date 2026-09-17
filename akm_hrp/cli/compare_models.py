@@ -61,11 +61,19 @@ from akm_hrp.backtest.engine import (
     run_walk_forward,
 )
 from akm_hrp.config import HRPConfig
+from akm_hrp.data.external_benchmarks import (
+    benchmark_backtest_result,
+    load_benchmark_returns,
+)
 from akm_hrp.data.returns import load_and_clean_returns
 from akm_hrp.diagnostics.dashboard import export_backtest_dashboard, _export_dashboard_period
 from akm_hrp.diagnostics.robustness import write_robustness_report
 from akm_hrp.diagnostics.significance import newey_west_mean_test
 from akm_hrp.overlay.bounds import apply_bounds
+from akm_hrp.signals.structural_alpha import (
+    STRUCTURAL_SIGNALS,
+    StructuralAlphaConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -220,6 +228,18 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Per-name weight floor for names retail_alpha_ml_mpc holds "
             "(e.g. 0.01 = 1%%). Default: 1/--retail-alpha-ml-max-total-assets."
+        ),
+    )
+    parser.add_argument(
+        "--retail-alpha-ml-selection",
+        choices=["signal", "core"],
+        default=None,
+        help=(
+            "How retail_alpha_ml_mpc picks the names it holds. 'signal' "
+            "(default): top --retail-alpha-ml-max-total-assets names by "
+            "composite signal score. 'core': the whole sector-balanced "
+            "balanced-PIT core (~170 names, no signal-based selection); the "
+            "signals only size positions, and the min-weight floor is off."
         ),
     )
     parser.add_argument(
@@ -610,6 +630,57 @@ def parse_args() -> argparse.Namespace:
         default=15,
         help="Number of top average weights shown in the heatmap (default: 15).",
     )
+    parser.add_argument(
+        "--external-benchmarks",
+        nargs="+",
+        default=[],
+        metavar="TICKER",
+        help=(
+            "Buy-and-hold ETF benchmarks added to every output next to the "
+            "models, e.g. URTH (iShares MSCI World). Weekly returns are read "
+            "from --external-benchmark-dir/<TICKER>_weekly_returns.csv, or "
+            "fetched once with yfinance if that file is missing. Each model "
+            "also gets <TICKER>_active_return / HAC t / p columns, computed on "
+            "the weeks the fund existed."
+        ),
+    )
+    parser.add_argument(
+        "--external-benchmark-dir",
+        default="data/benchmarks",
+        help="Cache directory for --external-benchmarks (default data/benchmarks).",
+    )
+    parser.add_argument(
+        "--structural-signals",
+        nargs="+",
+        default=[],
+        choices=[*STRUCTURAL_SIGNALS, "all"],
+        help=(
+            "Add HRP-orthogonal structural signals (beta-, cluster- and "
+            "industry-neutral, de-meaned, unit variance) to the "
+            "retail_alpha_ml_mpc family: moc_dislocation_reversal (needs "
+            "microstructure_alpha_features.csv.gz), microstructure_regime_ml, "
+            "regime_conditional_momentum, betting_against_beta (low-beta "
+            "anomaly; cluster/industry-neutral, not beta-neutral), or 'all'. "
+            "Default: none."
+        ),
+    )
+    parser.add_argument(
+        "--microstructure-features",
+        default=None,
+        help=(
+            "Weekly OHLC microstructure feature file from "
+            "akm_hrp.cli.build_microstructure_features. Default: "
+            "<bundle>/microstructure_alpha_features.csv.gz when it exists."
+        ),
+    )
+    parser.add_argument(
+        "--macro-features",
+        default=None,
+        help=(
+            "Optional weekly macro CSV (date index) for the regime HMM. "
+            "Default: <bundle>/crsp_treasury_weekly_returns.csv when it exists."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -855,6 +926,16 @@ def _ml_config_overrides(args) -> dict:
             f"budget of {budget} is inert. Lower --retail-alpha-ml-min-weight "
             f"to <= {1.0 / budget:.4f}, or lower the asset budget."
         )
+    selection = getattr(args, "retail_alpha_ml_selection", None)
+    if selection is not None:
+        overrides["ml_selection_mode"] = selection
+        if selection == "core" and floor is not None:
+            print(
+                "note: --retail-alpha-ml-selection core ignores "
+                f"--retail-alpha-ml-min-weight {floor} (the floor would "
+                "re-select names by optimizer weight).",
+                flush=True,
+            )
     return overrides
 
 
@@ -884,6 +965,11 @@ def main() -> None:
         )
     if args.deflated_sharpe_trials < 1:
         raise ValueError("--deflated-sharpe-trials must be at least 1.")
+    structural_signals = (
+        tuple(STRUCTURAL_SIGNALS)
+        if "all" in args.structural_signals
+        else tuple(dict.fromkeys(args.structural_signals))
+    )
     pit_path = args.pit
     dynamic_names = {
         "dynamic_barra_alpha",
@@ -1071,6 +1157,47 @@ def main() -> None:
                 "Dynamic universe model inputs are missing: "
                 + ", ".join(missing_paths)
             )
+        micro_path = (
+            Path(args.microstructure_features)
+            if args.microstructure_features
+            else bundle_root / "microstructure_alpha_features.csv.gz"
+        )
+        micro_valid_through = None
+        if structural_signals and micro_path.exists():
+            feature_paths.append(micro_path)
+            micro_valid_through = pd.to_datetime(
+                pd.read_csv(micro_path, usecols=["formation_date"])["formation_date"]
+            ).max()
+            returns_end = pd.Timestamp(returns.index[-1])
+            if micro_valid_through + pd.Timedelta(days=7) < returns_end:
+                print(
+                    f"warning: {micro_path.name} ends {micro_valid_through.date()} but "
+                    f"returns run to {returns_end.date()}; the microstructure "
+                    "signals switch off (zero coverage) after that date.",
+                    flush=True,
+                )
+        elif args.microstructure_features and not micro_path.exists():
+            raise FileNotFoundError(f"Missing --microstructure-features: {micro_path}")
+        elif structural_signals and {
+            "moc_dislocation_reversal", "microstructure_regime_ml"
+        }.intersection(structural_signals):
+            print(
+                f"warning: {micro_path} not found; moc_dislocation_reversal and "
+                "microstructure_regime_ml will have zero coverage. Build it with "
+                "python -m akm_hrp.cli.build_microstructure_features.",
+                flush=True,
+            )
+        macro_features = None
+        macro_path = (
+            Path(args.macro_features)
+            if args.macro_features
+            else bundle_root / "crsp_treasury_weekly_returns.csv"
+        )
+        if structural_signals and macro_path.exists():
+            macro_features = pd.read_csv(macro_path, index_col=0, parse_dates=True)
+            macro_features = macro_features.apply(pd.to_numeric, errors="coerce")
+        elif args.macro_features and not macro_path.exists():
+            raise FileNotFoundError(f"Missing --macro-features: {macro_path}")
         balanced_pit = pd.read_csv(
             balanced_path,
             index_col=0,
@@ -1110,7 +1237,13 @@ def main() -> None:
                 balanced_pit,
                 structural_features=dynamic_features,
                 sector_history=sector_history,
+                macro_features=macro_features,
                 config=RetailAlphaMLMPCConfig(
+                    structural_signals=structural_signals,
+                    structural_alpha=replace(
+                        StructuralAlphaConfig(),
+                        microstructure_valid_through=micro_valid_through,
+                    ),
                     maximum_added_assets=args.retail_max_added_assets,
                     portfolio_value=args.dynamic_portfolio_value,
                     planning_horizon=args.retail_mpc_horizon,
@@ -1146,7 +1279,13 @@ def main() -> None:
                 balanced_pit,
                 structural_features=dynamic_features,
                 sector_history=sector_history,
+                macro_features=macro_features,
                 config=RetailAlphaMLMPCConfig(
+                    structural_signals=structural_signals,
+                    structural_alpha=replace(
+                        StructuralAlphaConfig(),
+                        microstructure_valid_through=micro_valid_through,
+                    ),
                     maximum_added_assets=args.retail_max_added_assets,
                     portfolio_value=args.dynamic_portfolio_value,
                     planning_horizon=args.retail_mpc_horizon,
@@ -1179,7 +1318,13 @@ def main() -> None:
                 balanced_pit,
                 structural_features=dynamic_features,
                 sector_history=sector_history,
+                macro_features=macro_features,
                 config=RetailAlphaMLMPCConfig(
+                    structural_signals=structural_signals,
+                    structural_alpha=replace(
+                        StructuralAlphaConfig(),
+                        microstructure_valid_through=micro_valid_through,
+                    ),
                     maximum_added_assets=args.retail_max_added_assets,
                     portfolio_value=args.dynamic_portfolio_value,
                     planning_horizon=args.retail_mpc_horizon,
@@ -1280,6 +1425,34 @@ def main() -> None:
 
     failed_models: list[str] = []
     checkpoint_directory = Path(args.output).parent / "partial"
+
+    # External buy-and-hold benchmarks are known series, not walk-forwards.
+    # They go in first so the per-year dashboards written during the model
+    # runs already include them.
+    external_names: list[str] = []
+    for ticker in dict.fromkeys(t.upper() for t in args.external_benchmarks):
+        if ticker in models:
+            raise ValueError(f"External benchmark {ticker} clashes with a model name.")
+        series = load_benchmark_returns(ticker, args.external_benchmark_dir)
+        backtest_results[ticker] = benchmark_backtest_result(
+            ticker, series, returns.index
+        )
+        external_names.append(ticker)
+        live = backtest_results[ticker].portfolio_returns.dropna()
+        print(
+            f"external benchmark {ticker}: {len(live)} weeks "
+            f"{live.index[0]:%Y-%m-%d} .. {live.index[-1]:%Y-%m-%d}",
+            flush=True,
+        )
+        if args.evaluation_start is not None and live.index[0] > pd.Timestamp(
+            args.evaluation_start
+        ):
+            print(
+                f"warning: {ticker} starts {live.index[0]:%Y-%m-%d}, after "
+                f"--evaluation-start {pd.Timestamp(args.evaluation_start):%Y-%m-%d}; its metrics and the "
+                f"{ticker}_active_* columns cover only its own history.",
+                flush=True,
+            )
 
     def checkpoint(name, result, rows_so_far):
         """Persist one finished model's series and the metric rows so far.
@@ -1398,6 +1571,43 @@ def main() -> None:
                     )
         print(f"completed: {name}", flush=True)
 
+    for ticker in external_names:
+        result = backtest_results[ticker]
+        score_mask = pd.Series(True, index=result.portfolio_returns.index)
+        if args.evaluation_start is not None:
+            score_mask = result.portfolio_returns.index >= args.evaluation_start
+        rows.append({
+            "model": ticker,
+            **_compute_metrics(
+                result.portfolio_returns.loc[score_mask],
+                result.turnover.loc[score_mask],
+                risk_free_rate=config.risk_free_rate,
+                number_of_trials=significance_trials,
+            ),
+        })
+
+    for ticker in external_names:
+        external_returns = backtest_results[ticker].portfolio_returns
+        if args.evaluation_start is not None:
+            external_returns = external_returns.loc[
+                external_returns.index >= args.evaluation_start
+            ]
+        for row in rows:
+            model_returns = backtest_results[row["model"]].portfolio_returns
+            if args.evaluation_start is not None:
+                model_returns = model_returns.loc[
+                    model_returns.index >= args.evaluation_start
+                ]
+            active = model_returns.subtract(external_returns).dropna()
+            if row["model"] == ticker or len(active) < 10:
+                test = {"annualized_mean": 0.0, "hac_t_stat": 0.0, "hac_p_value": 1.0}
+            else:
+                test = newey_west_mean_test(active)
+            row[f"{ticker}_active_return"] = test["annualized_mean"]
+            row[f"{ticker}_alpha_hac_t_stat"] = test["hac_t_stat"]
+            row[f"{ticker}_alpha_hac_p_value"] = test["hac_p_value"]
+            row[f"{ticker}_overlap_weeks"] = float(len(active))
+
     benchmark_name = args.significance_benchmark
     if benchmark_name in backtest_results:
         benchmark_returns = backtest_results[benchmark_name].portfolio_returns
@@ -1422,7 +1632,7 @@ def main() -> None:
             "warning: these models failed and are absent from the outputs: "
             + ", ".join(failed_models)
         )
-    if not rows:
+    if not any(row["model"] not in external_names for row in rows):
         # main() is called bare at module scope, so `return` here would exit 0
         # and a caller scripting this would read the run as a success.
         raise SystemExit("error: every model failed; no comparison to write.")
@@ -1492,7 +1702,9 @@ def main() -> None:
         elif "regret_aware_with_overlay" in backtest_results:
             focus_model = "regret_aware_with_overlay"
         else:
-            focus_model = next(iter(backtest_results))
+            focus_model = next(
+                name for name in backtest_results if name not in external_names
+            )
 
         if focus_model not in backtest_results:
             raise ValueError(
