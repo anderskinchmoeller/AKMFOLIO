@@ -28,7 +28,7 @@
 # measured nothing. See claude/turnover_cap_freezes_slow_cadence_2026-09-15.md.
 #
 # --retail-alpha-ml-min-weight 0.01 replaces the derived 1/60 floor with an
-# explicit 1% floor, matching run_26w.sh.
+# explicit 1% floor, matching run_52w.sh.
 #
 # Note the ML config counts REBALANCES, not weeks, so the 13-week cadence
 # rescales it: refits every 5 rebalances are ~15 months apart, the "fast"

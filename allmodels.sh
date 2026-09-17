@@ -28,7 +28,7 @@
 # measured nothing. See claude/turnover_cap_freezes_slow_cadence_2026-09-15.md.
 #
 # --retail-alpha-ml-min-weight 0.01 replaces the derived 1/60 floor with an
-# explicit 1% floor, matching run_26w.sh.
+# explicit 1% floor, matching run_52w.sh.
 #
 # Note the ML config counts REBALANCES, not weeks, so the 13-week cadence
 # rescales it: refits every 5 rebalances are ~15 months apart, the "fast"
@@ -76,7 +76,7 @@ echo "cadence: 13w, max-total-assets budget: $BUDGET, min weight: 1%, turnover c
   --dynamic-portfolio-value 100000 \
   --retail-mpc-horizon 3 \
   --retail-max-added-assets 30 \
-  --retail-optimizer-max-iterations 450 \
+  --retail-optimizer-max-iterations 600 \
   --retail-alpha-ml-max-total-assets "$BUDGET" \
   --retail-alpha-ml-min-weight 0.01 \
   --retail-alpha-ml-max-training-cross-sections 252 \
@@ -88,7 +88,7 @@ echo "cadence: 13w, max-total-assets budget: $BUDGET, min weight: 1%, turnover c
   --retail-alpha-ml-allow-cvar-floor-relaxation \
   --progress-every-rebalances 1 \
   --dynamic-sector-history data/sector_history.csv \
-  --dynamic-features data/structural_features.csv \
+  --dynamic-features data/structural_features.csv data/compustat_pit_features_long.csv.gz \
   --dynamic-balanced-pit data/balanced_hrp/pit_universe.csv \
   --dynamic-balanced-returns data/balanced_hrp/weekly_returns.csv \
   --asset-metadata data/crsp_security_metadata.csv \
