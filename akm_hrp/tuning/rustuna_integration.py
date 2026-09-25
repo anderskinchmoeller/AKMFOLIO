@@ -127,7 +127,7 @@ def _evaluate_allocator_config(
 
     for result in results.values():
         sharpe = result.metrics.get("sharpe", np.nan)
-        ann_turnover = result.metrics.get("ann_turnover", np.nan)
+        ann_turnover = result.metrics.get("ann_turnover_l1", np.nan)
         max_drawdown = result.metrics.get("max_drawdown", np.nan)
 
         if np.isfinite(sharpe):

@@ -35,6 +35,7 @@ from akm_hrp.allocators.mapper_factor_nco import (
 )
 from akm_hrp.allocators.ra_hrp_allocator import RAHRPAllocator, RAHRPConfig
 from akm_hrp.allocators.ra_hrp_v2_allocator import RAHRPV2Allocator, RAHRPV2Config
+from akm_hrp.allocators.schur_hrp_allocator import SchurHRPAllocator, SchurHRPConfig
 from akm_hrp.allocators.regularized_minimum_variance import (
     RegularizedMinimumVarianceAllocator,
     RegularizedMinimumVarianceConfig,
@@ -379,6 +380,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=30,
         help="Maximum primary SLSQP iterations for retail_edge_mpc (default: 30).",
+    )
+    parser.add_argument(
+        "--schur-cov-halflife",
+        type=float,
+        default=26.0,
+        help=(
+            "EWMA half-life in weeks for the covariance used by schur_hrp and "
+            "schur_hrp_g1. A longer half-life gives a slower-moving covariance "
+            "and therefore lower turnover (default: 26.0)."
+        ),
     )
     parser.add_argument(
         "--deflated-sharpe-trials",
@@ -963,6 +974,8 @@ def main() -> None:
         raise ValueError(
             "--retail-edge-optimizer-max-iterations must be at least 1."
         )
+    if args.schur_cov_halflife <= 0.0:
+        raise ValueError("--schur-cov-halflife must be positive.")
     if args.deflated_sharpe_trials < 1:
         raise ValueError("--deflated-sharpe-trials must be at least 1.")
     structural_signals = (
@@ -1084,6 +1097,19 @@ def main() -> None:
             RAHRPV2Config(
                 max_weight=config.max_weight,
                 annual_risk_free_rate=config.risk_free_rate,
+            )
+        ),
+        "schur_hrp": SchurHRPAllocator(
+            SchurHRPConfig(
+                max_weight=config.max_weight,
+                cov_ewma_halflife=args.schur_cov_halflife,
+            )
+        ),
+        "schur_hrp_g1": SchurHRPAllocator(
+            SchurHRPConfig(
+                gamma=1.0,
+                max_weight=config.max_weight,
+                cov_ewma_halflife=args.schur_cov_halflife,
             )
         ),
         "hrp_alpha_v1": HRPAlphaV1Allocator(

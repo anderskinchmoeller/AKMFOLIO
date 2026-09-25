@@ -90,7 +90,7 @@ def _compute_metrics(
             "weekly_var_95": 0.0,
             "weekly_cvar_95": 0.0,
             "positive_week_fraction": 0.0,
-            "ann_turnover": 0.0,
+            "ann_turnover_l1": 0.0,
             "total_return": 0.0,
             "n_obs": 0.0,
         }
@@ -143,7 +143,7 @@ def _compute_metrics(
         "weekly_var_95": weekly_var_95,
         "weekly_cvar_95": weekly_cvar_95,
         "positive_week_fraction": float((r > 0.0).mean()),
-        "ann_turnover": float(t.mean() * WEEKS_PER_YEAR) if not t.empty else 0.0,
+        "ann_turnover_l1": float(t.mean() * WEEKS_PER_YEAR) if not t.empty else 0.0,
         "total_return": float(equity.iloc[-1] - 1.0),
         "n_obs": float(len(r)),
     }

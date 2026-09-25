@@ -38,7 +38,7 @@ class DiagnosticsReport:
     annual_return: float
     annual_vol: float
     max_drawdown: float
-    ann_turnover: float
+    ann_turnover_l1: float
     stability: float
     total_return: float
     n_weeks: int
@@ -168,7 +168,7 @@ def generate_diagnostics(
         annual_return=float(r.mean() * WEEKS_PER_YEAR),
         annual_vol=float(weekly_vol * np.sqrt(WEEKS_PER_YEAR)),
         max_drawdown=float(dd.min()),
-        ann_turnover=float(turnover.mean() * WEEKS_PER_YEAR),
+        ann_turnover_l1=float(turnover.mean() * WEEKS_PER_YEAR),
         stability=float(stability),
         total_return=float(equity.iloc[-1] - 1.0),
         n_weeks=int(len(r)),
@@ -209,7 +209,7 @@ def save_diagnostics_bundle(
         "annual_return": report.annual_return,
         "annual_vol": report.annual_vol,
         "max_drawdown": report.max_drawdown,
-        "ann_turnover": report.ann_turnover,
+        "ann_turnover_l1": report.ann_turnover_l1,
         "stability": report.stability,
         "total_return": report.total_return,
         "n_weeks": report.n_weeks,

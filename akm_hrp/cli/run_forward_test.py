@@ -59,7 +59,7 @@ def main():
     print("Forward-test complete.")
     print("Sharpe:", report.sharpe)
     print("Max Drawdown:", report.max_drawdown)
-    print("Turnover:", report.ann_turnover)
+    print("Turnover (L1/yr):", report.ann_turnover_l1)
 
 
 if __name__ == "__main__":

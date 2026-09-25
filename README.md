@@ -85,7 +85,7 @@ Useful `compare_models` flags (see `python -m akm_hrp.cli.compare_models --help`
 
 | flag | effect |
 |---|---|
-| `--models ...` | which models to run (`equal_weight`, `retail_alpha_ml_mpc`, `retail_alpha_ml_mpc_equal_weight`, `retail_alpha_ml_mpc_crowding`, `retail_alpha_mpc`, `dynamic_barra_alpha`, `ra_hrp_v2`, `hrp_alpha_v2`, …) |
+| `--models ...` | which models to run (`equal_weight`, `retail_alpha_ml_mpc`, `retail_alpha_ml_mpc_equal_weight`, `retail_alpha_ml_mpc_crowding`, `retail_alpha_mpc`, `dynamic_barra_alpha`, `ra_hrp_v2`, `schur_hrp`, `schur_hrp_g1`, `hrp_alpha_v2`, …) |
 | `--rebalance-every-weeks N` | rebalance cadence |
 | `--max-rebalance-turnover X` | per-rebalance L1 turnover cap; must be raised (e.g. 2.0) at slow cadences or the book freezes |
 | `--retail-alpha-ml-selection signal\|core` | `signal`: hold the top-N names by signal score; `core`: hold the whole balanced core, signals only size positions |

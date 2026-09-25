@@ -66,28 +66,18 @@ echo "Run directory: $PWD/$OUT"
 echo "cadence: 13w, max-total-assets budget: $BUDGET, min weight: 1%, max weight: none (3% cap removed), turnover cap: 2.0, benchmarks: equal_weight + URTH"
 "$PYTHON" -u -m akm_hrp.cli.compare_models \
   --returns data/weekly_returns.csv \
-  --models equal_weight retail_alpha_ml_mpc \
+  --models ra_hrp equal_weight \
   --pit data/pit_universe.csv \
-  --dashboard-every-year \
-  --rebalance-every-weeks 4 \
+  --rebalance-every-weeks 13 \
   --max-rebalance-turnover 2.0 \
   --lookback-weeks 260 \
   --tc-bps 10 \
   --dynamic-portfolio-value 100000 \
-  --retail-mpc-horizon 3 \
-  --retail-max-added-assets 50 \
-  --retail-optimizer-max-iterations 600 \
-  --retail-alpha-ml-max-total-assets "$BUDGET" \
-  --retail-alpha-ml-min-weight 0.01 \
-  --retail-alpha-ml-max-weight 1.0 \
-  --retail-alpha-ml-max-training-cross-sections 252 \
   "${DATA_START_ARGS[@]}" \
   --evaluation-start 2005-01-05 \
   --significance-benchmark equal_weight \
   --external-benchmarks URTH \
   --deflated-sharpe-trials 6 \
-  --retail-alpha-ml-allow-exposure-limit-relaxation \
-  --retail-alpha-ml-allow-cvar-floor-relaxation \
   --progress-every-rebalances 1 \
   --dynamic-sector-history data/sector_history.csv \
   --dynamic-features data/structural_features.csv data/compustat_pit_features_long.csv.gz \
